@@ -25,8 +25,7 @@ It bypasses the need to manually run `tailscale file get` by hooking directly in
 sudo usermod -aG tailscale $USER
 ```
 
-
-3. **Send a file:**
+**Send a file:**
 Open Tailscale on your phone or another device, select a file, and send it to this machine. You will see a notification in the terminal immediately.
 
 ## Technical Info
