@@ -60,6 +60,8 @@ pub async fn watch_files(event_tx: Sender<TailscaleEvent>) -> anyhow::Result<()>
                     continue;
                 }
 
+                log::warn!("RAW IPN BUS MESSAGE: {line}");
+
                 if let Ok(event) = serde_json::from_str::<super::tailscale::IpnBusNotification>(&line) {
                     // Handle incoming files
                     if let Some(incoming) = event.incoming_files {
@@ -129,20 +131,29 @@ pub async fn send_file(
     let client: Client<super::tailscale::UnixConnector, Full<Bytes>> =
         Client::builder(hyper_util::rt::TokioExecutor::new()).build(super::tailscale::UnixConnector);
 
+    let content_length = file_content.len();
+
     let req = Request::builder()
         .method(Method::PUT)
         .uri(format!(
-            "http://local-tailscaled.sock/localapi/v0/file-put/{}?name={}",
+            "http://local-tailscaled.sock/localapi/v0/file-put/{}/{}",
             peer_id,
             urlencoding::encode(file_name)
         ))
         .header("Host", "local-tailscaled.sock")
         .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", content_length)
         .body(Full::new(Bytes::from(file_content)))?;
 
+    log::info!("Sending file to {peer_id}: {file_name}");
+
     let res = client.request(req).await?;
+
     if !res.status().is_success() {
-        anyhow::bail!("File send failed with status: {}", res.status());
+        let status = res.status();
+        let body = res.into_body().collect().await?.to_bytes();
+        let body_text = String::from_utf8_lossy(&body);
+        anyhow::bail!("File send failed with status: {} - {}", status, body_text);
     }
 
     Ok(())

@@ -86,6 +86,7 @@ pub struct IpnBusNotification {
 pub async fn run_tailscale_backend(
     event_tx: Sender<TailscaleEvent>,
     mut command_rx: tokio_mpsc::UnboundedReceiver<TailscaleCommand>,
+    shared_status: super::status::SharedStatus,
 ) -> anyhow::Result<()> {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(UnixConnector);
 
@@ -112,18 +113,26 @@ pub async fn run_tailscale_backend(
         }
     }
 
+    // Spawn status HTTP server (0.0.0.0:8080/status)
+    let status_for_server = shared_status.clone();
+    let status_handle = tokio::spawn(async move {
+        if let Err(e) = super::status::run_status_server(status_for_server).await {
+            log::error!("Status server error: {:?}", e);
+        }
+    });
+
     // Spawn file watcher
     let event_tx_watcher = event_tx.clone();
     let watcher_handle = tokio::spawn(async move {
         if let Err(e) = super::files::watch_files(event_tx_watcher).await {
-            eprintln!("File watcher error: {:?}", e);
+            log::error!("File watcher error: {:?}", e);
         }
     });
 
-    // Spawn periodic status refresh
+    // Spawn periodic peer refresh
     let event_tx_status = event_tx.clone();
     let client_clone = client.clone();
-    let status_handle = tokio::spawn(async move {
+    let refresh_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
@@ -139,8 +148,48 @@ pub async fn run_tailscale_backend(
             TailscaleCommand::SendFile { peer_id, file_path } => {
                 let client = client.clone();
                 let event_tx = event_tx.clone();
+                let status = shared_status.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = super::files::send_file(&client, &peer_id, &file_path).await {
+                    let file_name = file_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    let file_size = tokio::fs::metadata(&file_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    // Mark as currently sending
+                    {
+                        let mut state = status.lock().unwrap();
+                        *state = Some(super::status::SentFileInfo {
+                            name: file_name.clone(),
+                            peer_id: peer_id.clone(),
+                            size: file_size,
+                            timestamp: super::status::unix_timestamp(),
+                            succeeded: false,
+                            sending: true,
+                        });
+                    }
+
+                    let result =
+                        super::files::send_file(&client, &peer_id, &file_path).await;
+
+                    // Update with final result
+                    {
+                        let mut state = status.lock().unwrap();
+                        *state = Some(super::status::SentFileInfo {
+                            name: file_name,
+                            peer_id: peer_id.clone(),
+                            size: file_size,
+                            timestamp: super::status::unix_timestamp(),
+                            succeeded: result.is_ok(),
+                            sending: false,
+                        });
+                    }
+
+                    if let Err(e) = result {
                         let _ = event_tx.send(TailscaleEvent::Error(format!(
                             "Failed to send file: {}",
                             e
@@ -160,6 +209,7 @@ pub async fn run_tailscale_backend(
     }
 
     watcher_handle.abort();
+    refresh_handle.abort();
     status_handle.abort();
     Ok(())
 }

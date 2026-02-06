@@ -23,6 +23,12 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
             }
         });
 
+        eframe::egui::Window::new("Logs")
+            .open(&mut self.show_logs)
+            .show(ctx, |ui| 
+            egui_logger::logger_ui().show(ui)
+        );
+
         // Top bar
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -43,6 +49,11 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⟳ Refresh").clicked() {
                         self.send_command(TailscaleCommand::RefreshPeers);
+                    }
+                    ui.separator();
+                    let show_hide_logs = if self.show_logs { "Hide Logs" } else { "Show Logs" };
+                    if ui.button(show_hide_logs).clicked() {
+                        self.show_logs = !self.show_logs;
                     }
                 });
             });
@@ -181,7 +192,7 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                 }
 
                 // Received files list
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     if self.received_files.is_empty() {
                         ui.label("No files received yet");
                         ui.label(RichText::new("Files sent via Taildrop will appear here").weak());
@@ -391,7 +402,7 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
             ui.separator();
 
             // Directory contents
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let mut nav_to = None;
                 let mut add_to_send = None;
 

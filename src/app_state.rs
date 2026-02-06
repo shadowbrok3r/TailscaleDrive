@@ -90,6 +90,9 @@ pub struct TailscaleDriveApp {
     pub current_directory: PathBuf,
     pub directory_contents: Vec<DirectoryEntry>,
     pub selected_directory_item: Option<usize>,
+
+    // Logs
+    pub show_logs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +125,7 @@ impl TailscaleDriveApp {
             current_directory: home,
             directory_contents: Vec::new(),
             selected_directory_item: None,
+            show_logs: false,
         };
 
         app.refresh_directory();
@@ -222,6 +226,7 @@ impl TailscaleDriveApp {
                         self.status_message = message;
                     }
                     TailscaleEvent::Error(err) => {
+                        log::error!("Error: {}", err);
                         self.status_message = format!("Error: {}", err);
                     }
                 }

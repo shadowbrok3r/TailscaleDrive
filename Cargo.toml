@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 eframe = { version="0.33", features=["persistence", "serde",  "default_fonts", "glow", "wayland"], default-features=false }
+egui_logger = "0.9"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full", "client-legacy"] }
@@ -16,6 +17,9 @@ tower = { version = "0.5.3", features = ["full"] }
 anyhow = "1"
 rfd = "0.17.2"
 urlencoding = "2"
+simplelog = "0.12"
+log = "0.4"
+axum = "0.8.8"
 
 [dependencies.egui]
 version = "0.33"
