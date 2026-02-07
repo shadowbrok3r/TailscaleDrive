@@ -21,7 +21,8 @@ pub struct TailscalePeer {
 #[derive(Debug, Clone)]
 pub struct ReceivedFile {
     pub name: String,
-    pub path: PathBuf,
+    /// Filesystem path from IncomingFiles FinalPath (if available)
+    pub path: Option<PathBuf>,
     pub size: u64,
     pub from_peer: String,
     pub received_at: std::time::Instant,
@@ -59,8 +60,12 @@ pub enum TailscaleCommand {
     SendFile { peer_id: String, file_path: PathBuf },
     /// Refresh Tailnet clients
     RefreshPeers,
-    /// Delete a received file from the temp location
-    DeleteReceivedFile(PathBuf),
+    /// Save a received file from the Taildrop inbox to a local path.
+    /// If `src_path` is available (from FinalPath), it copies directly;
+    /// otherwise it downloads via the local API.
+    SaveReceivedFile { name: String, src_path: Option<PathBuf>, dest: PathBuf },
+    /// Delete a received file from the Taildrop inbox
+    DeleteReceivedFile(String),
 }
 
 pub struct TailscaleDriveApp {
@@ -203,7 +208,7 @@ impl TailscaleDriveApp {
                     }
                     TailscaleEvent::FileReceived(file) => {
                         // Check if file already exists in list
-                        if !self.received_files.iter().any(|f| f.path == file.path) {
+                        if !self.received_files.iter().any(|f| f.name == file.name) {
                             self.received_files.push(file);
                         }
                     }

@@ -171,22 +171,36 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                 ui.heading("Received Files");
                 ui.separator();
 
-                // Active transfers
+                // Active transfers / incoming files
                 if !self.transferring_files.is_empty() {
-                    ui.label(RichText::new("Transferring...").strong());
-                    for transfer in &self.transferring_files {
+                    ui.label(RichText::new("Incoming").strong());
+                    let mut transfer_to_clear = None;
+                    for (tidx, transfer) in self.transferring_files.iter().enumerate() {
                         ui.horizontal(|ui| {
                             let progress = if transfer.size > 0 {
                                 transfer.transferred as f32 / transfer.size as f32
                             } else {
                                 0.0
                             };
+                            let stuck = transfer.transferred == 0 && transfer.size > 0;
                             ui.add(
                                 egui::ProgressBar::new(progress)
-                                    .text(&transfer.name)
-                                    .desired_width(200.0),
+                                    .text(if stuck {
+                                        format!("{} (stuck)", transfer.name)
+                                    } else {
+                                        transfer.name.clone()
+                                    })
+                                    .desired_width(180.0),
                             );
+                            if ui.small_button("🗙").on_hover_text("Clear from inbox").clicked() {
+                                transfer_to_clear = Some(tidx);
+                            }
                         });
+                    }
+                    if let Some(tidx) = transfer_to_clear {
+                        let name = self.transferring_files[tidx].name.clone();
+                        self.send_command(TailscaleCommand::DeleteReceivedFile(name));
+                        self.transferring_files.remove(tidx);
                     }
                     ui.separator();
                 }
@@ -202,30 +216,32 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
 
                         for (idx, file) in self.received_files.iter().enumerate() {
                             let is_selected = self.selected_received_file == Some(idx);
-
+                            
+                            
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
-                                    if ui.selectable_label(is_selected, "📄").clicked() {
-                                        self.selected_received_file = Some(idx);
-                                    }
-                                    ui.vertical(|ui| {
-                                        ui.label(RichText::new(&file.name).strong());
-                                        ui.label(
-                                            RichText::new(format_size(file.size)).weak().small(),
-                                        );
-                                    });
-                                });
+                                    // ui.vertical_centered_justified(|ui| {
+                                        if ui.selectable_label(is_selected, RichText::new(format!("📄 {}", &file.name)).strong()).clicked() {
+                                            self.selected_received_file = Some(idx);
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(format_size(file.size)).weak().small(),
+                                            );
+                                        });
+                                    // });
 
-                                if is_selected {
-                                    ui.horizontal(|ui| {
-                                        if ui.button("💾 Save As...").clicked() {
-                                            file_to_save = Some(idx);
-                                        }
-                                        if ui.button("🗑 Delete").clicked() {
-                                            file_to_delete = Some(idx);
-                                        }
-                                    });
-                                }
+                                    if is_selected {
+                                        ui.horizontal(|ui| {
+                                            if ui.button("💾 Save As...").clicked() {
+                                                file_to_save = Some(idx);
+                                            }
+                                            if ui.button("🗑 Delete").clicked() {
+                                                file_to_delete = Some(idx);
+                                            }
+                                        });
+                                    }
+                                });
                             });
                         }
 
@@ -236,12 +252,15 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                                     .set_file_name(&file.name)
                                     .save_file()
                                 {
-                                    if std::fs::copy(&file.path, &dest).is_ok() {
-                                        // Mark as saved or remove from list
-                                        if let Some(f) = self.received_files.get_mut(idx) {
-                                            f.saved = true;
-                                        }
-                                    }
+                                    self.send_command(TailscaleCommand::SaveReceivedFile {
+                                        name: file.name.clone(),
+                                        src_path: file.path.clone(),
+                                        dest,
+                                    });
+                                    // Remove from list so the name slot is freed.
+                                    // The background task handles the actual save + inbox cleanup.
+                                    self.received_files.remove(idx);
+                                    self.selected_received_file = None;
                                 }
                             }
                         }
@@ -250,7 +269,7 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                         if let Some(idx) = file_to_delete {
                             if let Some(file) = self.received_files.get(idx) {
                                 self.send_command(TailscaleCommand::DeleteReceivedFile(
-                                    file.path.clone(),
+                                    file.name.clone(),
                                 ));
                             }
                             self.received_files.remove(idx);

@@ -121,11 +121,38 @@ pub async fn run_tailscale_backend(
         }
     });
 
-    // Spawn file watcher
+    // Spawn IPN bus watcher (must stay lean — no blocking calls in the read loop)
     let event_tx_watcher = event_tx.clone();
     let watcher_handle = tokio::spawn(async move {
         if let Err(e) = super::files::watch_files(event_tx_watcher).await {
             log::error!("File watcher error: {:?}", e);
+        }
+    });
+
+    // Spawn periodic check for waiting files via the API.
+    // This catches files that arrived before the app started, or any
+    // that the IPN bus watcher might miss.
+    let event_tx_files = event_tx.clone();
+    let files_check_handle = tokio::spawn(async move {
+        let files_client = Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(UnixConnector);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if let Ok(waiting) = super::files::fetch_waiting_files(&files_client).await {
+                for wf in waiting {
+                    let _ = event_tx_files.send(TailscaleEvent::FileReceived(
+                        super::app_state::ReceivedFile {
+                            name: wf.name.clone(),
+                            path: None,
+                            size: wf.size as u64,
+                            from_peer: "Unknown".to_string(),
+                            received_at: std::time::Instant::now(),
+                            saved: false,
+                        },
+                    ));
+                }
+            }
         }
     });
 
@@ -202,13 +229,54 @@ pub async fn run_tailscale_backend(
                     let _ = event_tx.send(TailscaleEvent::PeersUpdated(peers));
                 }
             }
-            TailscaleCommand::DeleteReceivedFile(path) => {
-                let _ = std::fs::remove_file(&path);
+            TailscaleCommand::SaveReceivedFile { name, src_path, dest } => {
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let save_result = if let Some(src) = &src_path {
+                        // Fast path: copy directly from FinalPath on disk
+                        tokio::fs::copy(src, &dest).await
+                            .map(|_| ())
+                            .map_err(|e| anyhow::anyhow!("fs::copy failed: {}", e))
+                    } else {
+                        // Fallback: download via local API
+                        match super::files::download_received_file(&name).await {
+                            Ok(content) => tokio::fs::write(&dest, &content).await
+                                .map_err(|e| anyhow::anyhow!("write failed: {}", e)),
+                            Err(e) => Err(e),
+                        }
+                    };
+
+                    match save_result {
+                        Ok(()) => {
+                            log::info!("Saved '{}' to {:?}", name, dest);
+                            // Clean up from the Taildrop inbox
+                            if let Err(e) = super::files::delete_received_file(&name).await {
+                                log::warn!("Failed to clean up '{}' from inbox: {}", name, e);
+                            }
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(TailscaleEvent::Error(format!(
+                                "Failed to save file '{}': {}", name, e
+                            )));
+                        }
+                    }
+                });
+            }
+            TailscaleCommand::DeleteReceivedFile(name) => {
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = super::files::delete_received_file(&name).await {
+                        let _ = event_tx.send(TailscaleEvent::Error(format!(
+                            "Failed to delete file '{}': {}", name, e
+                        )));
+                    }
+                });
             }
         }
     }
 
     watcher_handle.abort();
+    files_check_handle.abort();
     refresh_handle.abort();
     status_handle.abort();
     Ok(())
