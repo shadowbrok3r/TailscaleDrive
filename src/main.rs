@@ -19,8 +19,8 @@ fn main() -> eframe::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<TailscaleEvent>();
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel::<TailscaleCommand>();
 
-    // Shared status for the HTTP status endpoint
-    let shared_status = status::new_shared_status();
+    // Shared state for the HTTP server and backend
+    let app_state = status::new_app_state();
 
     // Spawn the tokio runtime in a separate thread for the background task
     let event_tx_clone = event_tx.clone();
@@ -28,7 +28,7 @@ fn main() -> eframe::Result<()> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             // Run the tailscale watcher
-            if let Err(e) = tailscale::run_tailscale_backend(event_tx_clone, command_rx, shared_status).await {
+            if let Err(e) = tailscale::run_tailscale_backend(event_tx_clone, command_rx, app_state).await {
                 log::error!("Tailscale backend error: {:?}", e);
             }
         });

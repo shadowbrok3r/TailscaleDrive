@@ -1,11 +1,12 @@
 use http_body_util::{BodyExt, Empty, Full};
 use hyper_util::client::legacy::Client;
-use std::{path::PathBuf, sync::mpsc::Sender};
+use std::{path::PathBuf, sync::{mpsc::Sender, Arc, Mutex}};
 use hyper::{Method, Request};
 use serde::Deserialize;
 use bytes::Bytes;
 
 use super::app_state::{ReceivedFile, TailscaleEvent, TransferringFile};
+use super::status::ReceivedState;
 
 #[derive(Debug, Deserialize)]
 pub struct FileWaiting {
@@ -51,6 +52,13 @@ pub async fn fetch_waiting_files(
     let body = res.into_body().collect().await?.to_bytes();
     let files: Vec<FileWaiting> = serde_json::from_slice(&body)?;
     Ok(files)
+}
+
+/// Standalone version — creates its own client. For use outside the IPN bus loop.
+pub async fn list_waiting_files() -> anyhow::Result<Vec<FileWaiting>> {
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(super::tailscale::UnixConnector);
+    fetch_waiting_files(&client).await
 }
 
 /// Download a received file's content via /localapi/v0/files/{name}
@@ -101,7 +109,10 @@ pub async fn delete_received_file(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn watch_files(event_tx: Sender<TailscaleEvent>) -> anyhow::Result<()> {
+pub async fn watch_files(
+    event_tx: Sender<TailscaleEvent>,
+    received_state: Arc<Mutex<ReceivedState>>,
+) -> anyhow::Result<()> {
     let req = Request::builder()
         .uri("http://local-tailscaled.sock/localapi/v0/watch-ipn-bus")
         .header("Host", "local-tailscaled.sock")
@@ -142,6 +153,16 @@ pub async fn watch_files(event_tx: Sender<TailscaleEvent>) -> anyhow::Result<()>
                                     "File received: {} ({} bytes) at {:?}",
                                     file.name, file.size, path
                                 );
+
+                                // Update shared state for the status/download server
+                                {
+                                    let mut state = received_state.lock().unwrap();
+                                    state.last_file = Some(file.name.clone());
+                                    if let Some(ref p) = path {
+                                        state.file_paths.insert(file.name.clone(), p.clone());
+                                    }
+                                }
+
                                 let _ = event_tx.send(TailscaleEvent::FileReceived(
                                     ReceivedFile {
                                         name: file.name.clone(),

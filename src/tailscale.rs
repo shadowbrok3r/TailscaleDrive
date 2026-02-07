@@ -86,7 +86,7 @@ pub struct IpnBusNotification {
 pub async fn run_tailscale_backend(
     event_tx: Sender<TailscaleEvent>,
     mut command_rx: tokio_mpsc::UnboundedReceiver<TailscaleCommand>,
-    shared_status: super::status::SharedStatus,
+    app_state: super::status::AppState,
 ) -> anyhow::Result<()> {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(UnixConnector);
 
@@ -113,26 +113,47 @@ pub async fn run_tailscale_backend(
         }
     }
 
-    // Spawn status HTTP server (0.0.0.0:8080/status)
-    let status_for_server = shared_status.clone();
+    // Auto-configure `tailscale serve` to expose port 8080 on the tailnet
+    tokio::spawn(async {
+        match tokio::process::Command::new("tailscale")
+            .args(["serve", "--bg", "8080"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if output.status.success() {
+                    log::info!("Tailscale serve configured: {stdout}");
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::warn!("Tailscale serve setup: {}", stderr.trim());
+                }
+            }
+            Err(e) => log::error!("Failed to run 'tailscale serve': {}", e),
+        }
+    });
+
+    // Spawn status HTTP server (0.0.0.0:8080)
+    let state_for_server = app_state.clone();
     let status_handle = tokio::spawn(async move {
-        if let Err(e) = super::status::run_status_server(status_for_server).await {
+        if let Err(e) = super::status::run_status_server(state_for_server).await {
             log::error!("Status server error: {:?}", e);
         }
     });
 
     // Spawn IPN bus watcher (must stay lean — no blocking calls in the read loop)
     let event_tx_watcher = event_tx.clone();
+    let received_for_watcher = app_state.received.clone();
     let watcher_handle = tokio::spawn(async move {
-        if let Err(e) = super::files::watch_files(event_tx_watcher).await {
+        if let Err(e) = super::files::watch_files(event_tx_watcher, received_for_watcher).await {
             log::error!("File watcher error: {:?}", e);
         }
     });
 
     // Spawn periodic check for waiting files via the API.
-    // This catches files that arrived before the app started, or any
-    // that the IPN bus watcher might miss.
+    // Catches files received before the app started.
     let event_tx_files = event_tx.clone();
+    let received_for_checker = app_state.received.clone();
     let files_check_handle = tokio::spawn(async move {
         let files_client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(UnixConnector);
@@ -141,6 +162,14 @@ pub async fn run_tailscale_backend(
             interval.tick().await;
             if let Ok(waiting) = super::files::fetch_waiting_files(&files_client).await {
                 for wf in waiting {
+                    // Update the received state so the download server knows about these files
+                    {
+                        let mut state = received_for_checker.lock().unwrap();
+                        if state.last_file.is_none() {
+                            state.last_file = Some(wf.name.clone());
+                        }
+                    }
+
                     let _ = event_tx_files.send(TailscaleEvent::FileReceived(
                         super::app_state::ReceivedFile {
                             name: wf.name.clone(),
@@ -175,7 +204,7 @@ pub async fn run_tailscale_backend(
             TailscaleCommand::SendFile { peer_id, file_path } => {
                 let client = client.clone();
                 let event_tx = event_tx.clone();
-                let status = shared_status.clone();
+                let last_sent = app_state.last_sent.clone();
                 tokio::spawn(async move {
                     let file_name = file_path
                         .file_name()
@@ -189,7 +218,7 @@ pub async fn run_tailscale_backend(
 
                     // Mark as currently sending
                     {
-                        let mut state = status.lock().unwrap();
+                        let mut state = last_sent.lock().unwrap();
                         *state = Some(super::status::SentFileInfo {
                             name: file_name.clone(),
                             peer_id: peer_id.clone(),
@@ -205,7 +234,7 @@ pub async fn run_tailscale_backend(
 
                     // Update with final result
                     {
-                        let mut state = status.lock().unwrap();
+                        let mut state = last_sent.lock().unwrap();
                         *state = Some(super::status::SentFileInfo {
                             name: file_name,
                             peer_id: peer_id.clone(),

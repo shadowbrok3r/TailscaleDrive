@@ -406,16 +406,49 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                 if ui.button("⬆ Up").clicked() {
                     self.navigate_up();
                 }
-                if ui.button("🏠 Home").clicked() {
+                if ui.button("🏠").on_hover_text("Home").clicked() {
                     if let Ok(home) = std::env::var("HOME") {
                         self.navigate_to(PathBuf::from(home));
                     }
                 }
-                if ui.button("⟳").clicked() {
+                if ui.button("⟳").on_hover_text("Refresh").clicked() {
                     self.refresh_directory();
                 }
                 ui.separator();
-                ui.label(self.current_directory.to_string_lossy());
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.path_edit_text)
+                        .desired_width(ui.available_width())
+                );
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let path = PathBuf::from(&self.path_edit_text);
+                    if path.is_dir() {
+                        self.navigate_to(path);
+                    } else {
+                        // Reset to current directory if invalid
+                        self.path_edit_text = self.current_directory.to_string_lossy().to_string();
+                    }
+                }
+            });
+
+            // Quick-access folder buttons
+            ui.horizontal(|ui| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                let shortcuts = [
+                    ("📄 Documents", "Documents"),
+                    ("📥 Downloads", "Downloads"),
+                    ("🖥 Desktop", "Desktop"),
+                    ("🖼 Pictures", "Pictures"),
+                    ("🎬 Videos", "Videos"),
+                ];
+                for (label, folder) in shortcuts {
+                    let path = PathBuf::from(&home).join(folder);
+                    let enabled = path.is_dir();
+                    if ui.add_enabled(enabled, egui::Button::new(
+                        RichText::new(label).small()
+                    )).clicked() {
+                        self.navigate_to(path);
+                    }
+                }
             });
 
             ui.separator();

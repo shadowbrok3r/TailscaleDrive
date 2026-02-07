@@ -93,6 +93,7 @@ pub struct TailscaleDriveApp {
 
     // File explorer state
     pub current_directory: PathBuf,
+    pub path_edit_text: String,
     pub directory_contents: Vec<DirectoryEntry>,
     pub selected_directory_item: Option<usize>,
 
@@ -127,7 +128,8 @@ impl TailscaleDriveApp {
             search_query: String::new(),
             show_offline_peers: false,
             selected_received_file: None,
-            current_directory: home,
+            current_directory: home.clone(),
+            path_edit_text: home.to_string_lossy().to_string(),
             directory_contents: Vec::new(),
             selected_directory_item: None,
             show_logs: false,
@@ -188,6 +190,7 @@ impl TailscaleDriveApp {
     pub fn navigate_to(&mut self, path: PathBuf) {
         if path.is_dir() {
             self.current_directory = path;
+            self.path_edit_text = self.current_directory.to_string_lossy().to_string();
             self.refresh_directory();
         }
     }
@@ -195,6 +198,7 @@ impl TailscaleDriveApp {
     pub fn navigate_up(&mut self) {
         if let Some(parent) = self.current_directory.parent() {
             self.current_directory = parent.to_path_buf();
+            self.path_edit_text = self.current_directory.to_string_lossy().to_string();
             self.refresh_directory();
         }
     }
