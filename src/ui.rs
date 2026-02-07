@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, RichText, Sense, StrokeKind, Vec2};
+use egui::{Layout, TextEdit, Widget};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
@@ -62,7 +63,7 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
         // Device list
         egui::SidePanel::left("devices_panel")
             .default_width(200.0)
-            .max_width(200.0)
+            .max_width(500.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("Devices");
@@ -70,14 +71,15 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
 
                 ui.horizontal(|ui| {
                     ui.label("🔍");
-                    ui.text_edit_singleline(&mut self.search_query);
+                    TextEdit::singleline(&mut self.search_query).desired_width(ui.available_width()/2.).ui(ui);
+                    ui.separator();
+                    ui.with_layout(Layout::right_to_left(egui::Align::Max), |ui| {
+                        ui.checkbox(&mut self.show_offline_peers, "Show offline");
+                    })
                 });
 
-                ui.checkbox(&mut self.show_offline_peers, "Show offline devices");
-                ui.separator();
-
                 // Device list
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ui.available_height()/1.5).show(ui, |ui| {
                     self.peers.sort_by(|a, b | {
                         match (a.online, b.online) {
                             (true, false) => Ordering::Less,
@@ -162,14 +164,8 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                         }
                     }
                 });
-            });
 
-        // Received files
-        egui::SidePanel::right("received_panel")
-            .default_width(300.0)
-            .max_width(500.0)
-            .resizable(true)
-            .show(ctx, |ui| {
+                ui.separator();
                 ui.heading("Received Files");
                 ui.separator();
 
@@ -208,10 +204,9 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                 }
 
                 // Received files list
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([true, false]).show(ui, |ui| {
                     if self.received_files.is_empty() {
-                        ui.label("No files received yet");
-                        ui.label(RichText::new("Files sent via Taildrop will appear here").weak());
+                        ui.label(RichText::new("No files received yet").weak());
                     } else {
                         let mut file_to_save = None;
                         let mut file_to_delete = None;
