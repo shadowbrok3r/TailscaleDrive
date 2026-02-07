@@ -61,7 +61,8 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
 
         // Device list
         egui::SidePanel::left("devices_panel")
-            .default_width(280.0)
+            .default_width(200.0)
+            .max_width(200.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("Devices");
@@ -166,6 +167,7 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
         // Received files
         egui::SidePanel::right("received_panel")
             .default_width(300.0)
+            .max_width(500.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("Received Files");
@@ -220,28 +222,26 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                             
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
-                                    // ui.vertical_centered_justified(|ui| {
-                                        if ui.selectable_label(is_selected, RichText::new(format!("📄 {}", &file.name)).strong()).clicked() {
-                                            self.selected_received_file = Some(idx);
-                                        }
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                RichText::new(format_size(file.size)).weak().small(),
-                                            );
-                                        });
-                                    // });
-
-                                    if is_selected {
-                                        ui.horizontal(|ui| {
-                                            if ui.button("💾 Save As...").clicked() {
-                                                file_to_save = Some(idx);
-                                            }
-                                            if ui.button("🗑 Delete").clicked() {
-                                                file_to_delete = Some(idx);
-                                            }
-                                        });
+                                    if ui.selectable_label(is_selected, RichText::new(format!("📄 {}", &file.name)).strong()).clicked() {
+                                        self.selected_received_file = Some(idx);
                                     }
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(format_size(file.size)).weak().small(),
+                                        );
+                                    });
                                 });
+
+                                if is_selected {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("💾 Save As...").clicked() {
+                                            file_to_save = Some(idx);
+                                        }
+                                        if ui.button("🗑 Delete").clicked() {
+                                            file_to_delete = Some(idx);
+                                        }
+                                    });
+                                }
                             });
                         }
 
