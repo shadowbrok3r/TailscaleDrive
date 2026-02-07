@@ -1,1 +1,10 @@
 /target
+TailscaleDrive/.DS_Store
+TailscaleDrive/.build
+TailscaleDrive/Packages
+TailscaleDrive/xcuserdata/
+TailscaleDrive/DerivedData/
+TailscaleDrive/.swiftpm/configuration/registries.json
+TailscaleDrive/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+TailscaleDrive/.netrc
+TailscaleDrive/xtool
