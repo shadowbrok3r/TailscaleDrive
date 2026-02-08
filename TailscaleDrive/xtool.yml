@@ -1,3 +1,4 @@
 version: 1
 bundleID: com.example.TailscaleDrive
 iconPath: Resources/AppIcon.png
+infoPath: Info.override.plist

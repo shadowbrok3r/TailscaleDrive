@@ -99,6 +99,11 @@ pub async fn run_tailscale_backend(
     // Fetch initial peer list
     match fetch_status(&client).await {
         Ok(peers) => {
+            // Update shared state for HTTP server
+            {
+                let mut shared_peers = app_state.peers.lock().unwrap();
+                *shared_peers = peers.clone();
+            }
             let _ = event_tx.send(TailscaleEvent::PeersUpdated(peers));
             let _ = event_tx.send(TailscaleEvent::ConnectionStatus(
                 true,
@@ -188,11 +193,17 @@ pub async fn run_tailscale_backend(
     // Spawn periodic peer refresh
     let event_tx_status = event_tx.clone();
     let client_clone = client.clone();
+    let peers_shared = app_state.peers.clone();
     let refresh_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
             if let Ok(peers) = fetch_status(&client_clone).await {
+                // Update shared state for HTTP server
+                {
+                    let mut shared = peers_shared.lock().unwrap();
+                    *shared = peers.clone();
+                }
                 let _ = event_tx_status.send(TailscaleEvent::PeersUpdated(peers));
             }
         }
@@ -255,6 +266,10 @@ pub async fn run_tailscale_backend(
             }
             TailscaleCommand::RefreshPeers => {
                 if let Ok(peers) = fetch_status(&client).await {
+                    {
+                        let mut shared = app_state.peers.lock().unwrap();
+                        *shared = peers.clone();
+                    }
                     let _ = event_tx.send(TailscaleEvent::PeersUpdated(peers));
                 }
             }

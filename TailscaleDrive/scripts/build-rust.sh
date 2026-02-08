@@ -24,7 +24,7 @@ find "$SWIFT_DST" -maxdepth 1 -type f -name '*.swift' \
     base="$(basename "$f")"
     case "$base" in
       SwiftBridgeCore.swift|tailscale-drive.swift) : ;;  # already removed above
-      ContentView.swift|TailscaleDriveApp.swift|RendererHandle.swift|BridgeFFIImport.swift) : ;; # keep app files
+      ContentView.swift|TailscaleDriveApp.swift|RendererHandle.swift|BridgeFFIImport.swift|AppFiles.swift) : ;; # keep app files
       *) rm -f "$f" ;; # remove any other stray generated swift
     esac
   done

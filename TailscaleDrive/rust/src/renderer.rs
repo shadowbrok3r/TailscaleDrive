@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use egui::{pos2, vec2, Color32, RichText};
 use egui_wgpu_backend::{RenderPass as EguiWgpuRenderer, ScreenDescriptor};
 
-use crate::tailscale_client::{format_size, format_timestamp, TailscaleClient};
+use crate::tailscale_client::{format_size, format_timestamp, load_cached_peers, TailscaleClient};
 
 const DEFAULT_SERVER_URL: &str = "http://manjaro-work.taile483f.ts.net:8080";
 
@@ -13,6 +13,23 @@ const DEFAULT_SERVER_URL: &str = "http://manjaro-work.taile483f.ts.net:8080";
 pub enum Page {
     Monitor,
     ProjectSync,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SyncStep {
+    /// Browsing local files and active syncs list
+    BrowseLocal,
+    /// Picking a remote destination for the selected file
+    PickRemoteDest,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalFileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: u64,
 }
 
 pub struct Renderer {
@@ -45,6 +62,19 @@ pub struct Renderer {
     pending_notifications: Vec<(String, String)>,
     last_known_received: Option<String>,
     last_known_sent_name: Option<String>,
+
+    // Peer selection (by hostname for stability across refreshes)
+    selected_peer_id: Option<String>,
+
+    // ── Project Sync UI state ──
+    sync_step: SyncStep,
+    local_browse_path: String,
+    local_files: Vec<LocalFileEntry>,
+    selected_local_idx: Option<usize>,
+    /// The local file path selected for syncing
+    sync_local_file: Option<String>,
+    /// Whether we already fetched sync projects from server
+    sync_projects_fetched: bool,
 
     // iOS keyboard state
     wants_keyboard: bool,
@@ -131,6 +161,15 @@ impl Renderer {
             pending_notifications: Vec::new(),
             last_known_received: None,
             last_known_sent_name: None,
+            selected_peer_id: None,
+
+            sync_step: SyncStep::BrowseLocal,
+            local_browse_path: String::new(),
+            local_files: Vec::new(),
+            selected_local_idx: None,
+            sync_local_file: None,
+            sync_projects_fetched: false,
+
             wants_keyboard: false,
         }
     }
@@ -142,6 +181,13 @@ impl Renderer {
     /// Set the directory where downloaded/pulled files are saved (iOS Documents dir).
     pub fn set_save_directory(&mut self, path: &str) {
         self.client.save_directory = Some(path.to_string());
+        // Load cached peers so the device list is available even when disconnected
+        if self.client.peers.is_empty() {
+            let cached = load_cached_peers(path);
+            if !cached.is_empty() {
+                self.client.peers = cached;
+            }
+        }
     }
 
     /// Returns true when there's a newly-saved file ready for the iOS share sheet.
@@ -319,6 +365,11 @@ impl Renderer {
             }
         }
 
+        // Drain sync notifications
+        while let Some((title, body)) = self.client.pending_sync_notifications.pop() {
+            self.pending_notifications.push((title, body));
+        }
+
         // Validate selected file index
         if let Some(idx) = self.selected_file_idx {
             if idx >= self.client.waiting_files.len() {
@@ -361,6 +412,10 @@ impl Renderer {
             let mut do_refresh = false;
             let mut do_browse: Option<Option<String>> = None;
             let mut file_to_pull: Option<String> = None;
+            let mut do_upload: Option<(String, String)> = None; // (local, remote)
+            let mut do_create_sync: Option<(String, String)> = None; // (local, remote)
+            let mut do_delete_sync: Option<String> = None;
+            let mut do_fetch_sync_projects = false;
 
             // ═══════════════════════════════════════════════════
             //  TOP BAR
@@ -425,6 +480,22 @@ impl Renderer {
                             do_browse = Some(None);
                             self.browse_fetched = true;
                         }
+                        if !self.sync_projects_fetched {
+                            self.client.fetch_sync_projects();
+                            self.sync_projects_fetched = true;
+                        }
+                        // Initialize local browse path from save directory
+                        if self.local_browse_path.is_empty() {
+                            if let Some(ref dir) = self.client.save_directory {
+                                // Go up from Downloads to the Documents dir
+                                if let Some(parent) = std::path::Path::new(dir).parent() {
+                                    self.local_browse_path = parent.to_string_lossy().to_string();
+                                } else {
+                                    self.local_browse_path = dir.clone();
+                                }
+                            }
+                            self.refresh_local_files();
+                        }
                     }
                 });
 
@@ -445,6 +516,8 @@ impl Renderer {
                                     &mut reconnect_url,
                                     &mut file_to_download,
                                     &mut do_download_last,
+                                    &mut do_browse,
+                                    &mut file_to_pull,
                                 );
                             }
                             Page::ProjectSync => {
@@ -452,6 +525,10 @@ impl Renderer {
                                     ui,
                                     &mut do_browse,
                                     &mut file_to_pull,
+                                    &mut do_upload,
+                                    &mut do_create_sync,
+                                    &mut do_delete_sync,
+                                    &mut do_fetch_sync_projects,
                                 );
                             }
                         }
@@ -474,6 +551,21 @@ impl Renderer {
             if let Some(ref name) = file_to_pull {
                 self.client.pull_file(name);
             }
+            if let Some((local, remote)) = do_upload {
+                self.client.upload_file(&local, &remote);
+            }
+            if let Some((local, remote)) = do_create_sync {
+                self.client.upload_file(&local, &remote);
+                self.client.create_sync_project(&local, &remote);
+                self.sync_step = SyncStep::BrowseLocal;
+                self.sync_local_file = None;
+            }
+            if let Some(id) = do_delete_sync {
+                self.client.delete_sync_project(&id);
+            }
+            if do_fetch_sync_projects {
+                self.client.fetch_sync_projects();
+            }
         });
 
         // Update keyboard state — use wants_keyboard_input() which checks
@@ -484,7 +576,12 @@ impl Renderer {
 
         // Handle reconnect after run() (needs &mut self.client)
         if let Some(url) = reconnect_url {
+            // Preserve cached peers across reconnect
+            let cached_peers = std::mem::take(&mut self.client.peers);
+            let save_dir = self.client.save_directory.clone();
             self.client = TailscaleClient::new(&url);
+            self.client.peers = cached_peers;
+            self.client.save_directory = save_dir;
             self.browse_fetched = false;
             self.auto_browsed = false;
             self.selected_remote_idx = None;
@@ -564,6 +661,8 @@ impl Renderer {
         reconnect_url: &mut Option<String>,
         file_to_download: &mut Option<String>,
         do_download_last: &mut bool,
+        do_browse: &mut Option<Option<String>>,
+        file_to_pull: &mut Option<String>,
     ) {
         // ─── Server Config ───
         ui.group(|ui| {
@@ -586,6 +685,98 @@ impl Renderer {
                     }
                 }
             });
+
+            // ─── Peer ComboBox (always visible, uses cached list when disconnected) ───
+            ui.add_space(4.0);
+
+            if self.client.peers.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label("Device:");
+                    ui.label(RichText::new("No devices known yet — connect to a server first").weak().small());
+                });
+            } else {
+                // Build a stable sorted index: online first, then alphabetical
+                let mut sorted_indices: Vec<usize> = (0..self.client.peers.len()).collect();
+                sorted_indices.sort_by(|&a, &b| {
+                    let pa = &self.client.peers[a];
+                    let pb = &self.client.peers[b];
+                    match (pa.online, pb.online) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => pa.hostname.to_lowercase().cmp(&pb.hostname.to_lowercase()),
+                    }
+                });
+
+                // Find the currently selected peer by ID
+                let selected_peer = self.selected_peer_id.as_ref().and_then(|id| {
+                    self.client.peers.iter().find(|p| &p.id == id)
+                });
+
+                let current_label = selected_peer
+                    .map(|p| {
+                        let os_icon = match p.os.to_lowercase().as_str() {
+                            "linux" => "🐧",
+                            "macos" => "🍎",
+                            "windows" => "🪟",
+                            "android" => "📱",
+                            "ios" => "🍎",
+                            _ => "🖥",
+                        };
+                        format!("{} {} ({})", os_icon, p.hostname, if p.online { "online" } else { "offline" })
+                    })
+                    .unwrap_or_else(|| "Select a device…".to_string());
+
+                let source_hint = if !self.client.connected { " (cached)" } else { "" };
+
+                ui.horizontal(|ui| {
+                    ui.label(format!("Device{}:", source_hint));
+                    egui::ComboBox::from_id_salt("peer_combo")
+                        .selected_text(&current_label)
+                        .width(ui.available_width() - 4.0)
+                        .show_ui(ui, |ui| {
+                            for &idx in &sorted_indices {
+                                let peer = &self.client.peers[idx];
+                                let os_icon = match peer.os.to_lowercase().as_str() {
+                                    "linux" => "🐧",
+                                    "macos" => "🍎",
+                                    "windows" => "🪟",
+                                    "android" => "📱",
+                                    "ios" => "🍎",
+                                    _ => "🖥",
+                                };
+                                let status_color = if peer.online {
+                                    Color32::from_rgb(46, 204, 113)
+                                } else {
+                                    Color32::from_rgb(150, 150, 150)
+                                };
+                                let status = if peer.online { "online" } else { "offline" };
+                                let label = format!("{} {} ({})", os_icon, peer.hostname, status);
+                                let is_selected = self.selected_peer_id.as_ref() == Some(&peer.id);
+                                let resp = ui.selectable_label(is_selected, RichText::new(&label).color(status_color));
+                                if resp.clicked() {
+                                    self.selected_peer_id = Some(peer.id.clone());
+                                    let dns = peer.dns_name.trim_end_matches('.');
+                                    let new_url = format!("http://{}:8080", dns);
+                                    self.server_url_input = new_url.clone();
+                                    *reconnect_url = Some(new_url);
+                                }
+                            }
+                        });
+                });
+
+                // Show selected peer details
+                if let Some(peer) = selected_peer {
+                    ui.label(
+                        RichText::new(format!(
+                            "DNS: {}  IP: {}",
+                            peer.dns_name.trim_end_matches('.'),
+                            peer.ip_addresses.first().unwrap_or(&"N/A".to_string())
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            }
         });
 
         ui.add_space(8.0);
@@ -697,24 +888,510 @@ impl Renderer {
                 }
             }
         });
+
+        ui.add_space(8.0);
+
+        // ─── Remote File Browser ───
+        ui.group(|ui| {
+            ui.label(
+                RichText::new("REMOTE FILE BROWSER")
+                    .strong()
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            ui.add_space(4.0);
+
+            // Navigation bar
+            ui.horizontal(|ui| {
+                if ui.button("⬆ Up").clicked() {
+                    if let Some(pos) = self.browse_path_input.rfind('/') {
+                        self.browse_path_input.truncate(pos);
+                        if self.browse_path_input.is_empty() {
+                            self.browse_path_input = "/".to_string();
+                        }
+                    } else {
+                        self.browse_path_input = "/".to_string();
+                    }
+                    *do_browse = Some(Some(self.browse_path_input.clone()));
+                    self.selected_remote_idx = None;
+                }
+
+                if ui.button("🏠").clicked() {
+                    if let Some(ref cwd) = self.client.server_cwd {
+                        self.browse_path_input = cwd.clone();
+                        *do_browse = Some(Some(cwd.clone()));
+                        self.selected_remote_idx = None;
+                    }
+                }
+
+                if ui.button("⟳").clicked() {
+                    let path = if self.browse_path_input.is_empty() {
+                        None
+                    } else {
+                        Some(self.browse_path_input.clone())
+                    };
+                    *do_browse = Some(path);
+                }
+            });
+
+            // Path display
+            ui.label(
+                RichText::new(&self.browse_path_input)
+                    .weak()
+                    .small(),
+            );
+
+            // Status toast
+            if let Some(ref status) = self.client.browse_status {
+                let color = if status.starts_with('✓') {
+                    Color32::from_rgb(46, 204, 113)
+                } else {
+                    Color32::GRAY
+                };
+                ui.colored_label(color, status.as_str());
+            }
+
+            ui.separator();
+
+            // Directory contents
+            if self.client.remote_files.is_empty() && !self.client.connected {
+                ui.label(RichText::new("Not connected — waiting for server…").weak());
+            } else if self.client.remote_files.is_empty() {
+                ui.label(RichText::new("Empty directory").weak());
+            } else {
+                let mut dir_indices: Vec<usize> = Vec::new();
+                let mut file_indices: Vec<usize> = Vec::new();
+                for (i, f) in self.client.remote_files.iter().enumerate() {
+                    if f.is_dir {
+                        dir_indices.push(i);
+                    } else {
+                        file_indices.push(i);
+                    }
+                }
+                dir_indices.sort_by(|&a, &b| {
+                    self.client.remote_files[a]
+                        .name
+                        .to_lowercase()
+                        .cmp(&self.client.remote_files[b].name.to_lowercase())
+                });
+                file_indices.sort_by(|&a, &b| {
+                    self.client.remote_files[a]
+                        .name
+                        .to_lowercase()
+                        .cmp(&self.client.remote_files[b].name.to_lowercase())
+                });
+
+                let sorted: Vec<usize> = dir_indices
+                    .iter()
+                    .chain(file_indices.iter())
+                    .copied()
+                    .collect();
+
+                let mut nav_to: Option<String> = None;
+
+                for &idx in &sorted {
+                    let entry = &self.client.remote_files[idx];
+                    let is_selected = self.selected_remote_idx == Some(idx);
+                    let icon = if entry.is_dir { "📂" } else { "📄" };
+
+                    let label_text = if entry.is_dir {
+                        format!("{} {}/", icon, entry.name)
+                    } else {
+                        format!(
+                            "{} {} ({})",
+                            icon,
+                            entry.name,
+                            format_size(entry.size as u64)
+                        )
+                    };
+
+                    let response =
+                        ui.selectable_label(is_selected, RichText::new(&label_text));
+
+                    if response.clicked() {
+                        if entry.is_dir {
+                            let new_path = if self.browse_path_input.is_empty()
+                                || self.browse_path_input == "/"
+                            {
+                                format!("/{}", entry.name)
+                            } else {
+                                format!("{}/{}", self.browse_path_input, entry.name)
+                            };
+                            nav_to = Some(new_path);
+                        } else {
+                            self.selected_remote_idx = Some(idx);
+                        }
+                    }
+                }
+
+                if let Some(new_path) = nav_to {
+                    self.browse_path_input = new_path.clone();
+                    *do_browse = Some(Some(new_path));
+                    self.selected_remote_idx = None;
+                }
+            }
+
+            // Action buttons for selected remote file
+            if let Some(sel_idx) = self.selected_remote_idx {
+                if let Some(selected) = self.client.remote_files.get(sel_idx) {
+                    if !selected.is_dir {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("📄 {}", selected.name)).strong(),
+                            );
+                            ui.label(
+                                RichText::new(format_size(selected.size as u64))
+                                    .weak()
+                                    .small(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "Modified: {}",
+                                    format_timestamp(selected.modified)
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        });
+                        if ui.button("📥 Pull File to iPhone").clicked() {
+                            let full_path = if self.browse_path_input.is_empty()
+                                || self.browse_path_input == "/"
+                            {
+                                format!("/{}", selected.name)
+                            } else {
+                                format!("{}/{}", self.browse_path_input, selected.name)
+                            };
+                            *file_to_pull = Some(full_path);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  PAGE 2: FILE BROWSER  (remote desktop filesystem)
+    //  PAGE 2: PROJECT SYNC
     // ═══════════════════════════════════════════════════════════════════
+
+    fn refresh_local_files(&mut self) {
+        self.local_files.clear();
+        self.selected_local_idx = None;
+
+        let path = if self.local_browse_path.is_empty() {
+            return;
+        } else {
+            &self.local_browse_path
+        };
+
+        if let Ok(entries) = std::fs::read_dir(path) {
+            let mut items: Vec<LocalFileEntry> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') {
+                        return None;
+                    }
+                    let metadata = entry.metadata().ok()?;
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    Some(LocalFileEntry {
+                        name,
+                        path: entry.path().to_string_lossy().to_string(),
+                        is_dir: metadata.is_dir(),
+                        size: metadata.len(),
+                        modified,
+                    })
+                })
+                .collect();
+
+            items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            });
+
+            self.local_files = items;
+        }
+    }
 
     fn draw_project_sync_page(
         &mut self,
         ui: &mut egui::Ui,
         do_browse: &mut Option<Option<String>>,
         file_to_pull: &mut Option<String>,
+        do_upload: &mut Option<(String, String)>,
+        do_create_sync: &mut Option<(String, String)>,
+        do_delete_sync: &mut Option<String>,
+        do_fetch_sync_projects: &mut bool,
     ) {
-        ui.heading("File Browser");
+        match self.sync_step {
+            SyncStep::BrowseLocal => {
+                self.draw_sync_browse_local(ui, do_browse, file_to_pull, do_upload, do_delete_sync, do_fetch_sync_projects);
+            }
+            SyncStep::PickRemoteDest => {
+                self.draw_sync_pick_remote(ui, do_browse, do_create_sync);
+            }
+        }
+    }
+
+    fn draw_sync_browse_local(
+        &mut self,
+        ui: &mut egui::Ui,
+        _do_browse: &mut Option<Option<String>>,
+        _file_to_pull: &mut Option<String>,
+        do_upload: &mut Option<(String, String)>,
+        do_delete_sync: &mut Option<String>,
+        do_fetch_sync_projects: &mut bool,
+    ) {
+        // ═══════════════════════════════════════════
+        //  ACTIVE SYNCS LIST
+        // ═══════════════════════════════════════════
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("ACTIVE SYNCS")
+                        .strong()
+                        .small()
+                        .color(Color32::GRAY),
+                );
+                ui.label(
+                    RichText::new(format!("({})", self.client.sync_projects.len()))
+                        .weak()
+                        .small(),
+                );
+                if ui.small_button("⟳").clicked() {
+                    *do_fetch_sync_projects = true;
+                }
+            });
+            ui.add_space(4.0);
+
+            if self.client.sync_projects.is_empty() {
+                ui.label(RichText::new("No active syncs — select a file below to start").weak());
+            } else {
+                let mut delete_id: Option<String> = None;
+                for project in &self.client.sync_projects {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            let status_icon = if project.paused { "⏸" } else { "🔄" };
+                            ui.label(RichText::new(status_icon));
+                            ui.vertical(|ui| {
+                                // Show just filenames
+                                let local_name = project.local_path
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&project.local_path);
+                                ui.label(RichText::new(local_name).strong());
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Last synced: {}",
+                                        format_timestamp(project.last_synced)
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("🗑").clicked() {
+                                        delete_id = Some(project.id.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                }
+                if let Some(id) = delete_id {
+                    *do_delete_sync = Some(id);
+                }
+            }
+
+            // Sync status toast
+            if let Some(ref status) = self.client.sync_status {
+                ui.add_space(4.0);
+                let color = if status.starts_with('✓') {
+                    Color32::from_rgb(46, 204, 113)
+                } else {
+                    Color32::GRAY
+                };
+                ui.colored_label(color, status.as_str());
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // ═══════════════════════════════════════════
+        //  LOCAL FILE BROWSER (iOS App Sandbox)
+        // ═══════════════════════════════════════════
+        ui.label(
+            RichText::new("LOCAL FILES (App Documents)")
+                .strong()
+                .small()
+                .color(Color32::GRAY),
+        );
+
+        // Show the current full path so the user knows where they are
+        ui.label(
+            RichText::new(&self.local_browse_path)
+                .weak()
+                .small(),
+        );
         ui.add_space(4.0);
 
-        // ─── Navigation bar ───
+        // Navigation bar
         ui.horizontal(|ui| {
-            // Up button
+            if ui.button("⬆ Up").clicked() {
+                if let Some(parent) = std::path::Path::new(&self.local_browse_path).parent() {
+                    self.local_browse_path = parent.to_string_lossy().to_string();
+                    if self.local_browse_path.is_empty() {
+                        self.local_browse_path = "/".to_string();
+                    }
+                    self.refresh_local_files();
+                }
+            }
+
+            if ui.button("🏠 Documents").clicked() {
+                if let Some(ref dir) = self.client.save_directory {
+                    if let Some(parent) = std::path::Path::new(dir).parent() {
+                        self.local_browse_path = parent.to_string_lossy().to_string();
+                    } else {
+                        self.local_browse_path = dir.clone();
+                    }
+                    self.refresh_local_files();
+                }
+            }
+
+            if ui.button("📥 Downloads").clicked() {
+                if let Some(ref dir) = self.client.save_directory {
+                    self.local_browse_path = dir.clone();
+                    self.refresh_local_files();
+                }
+            }
+
+            if ui.button("⟳").clicked() {
+                self.refresh_local_files();
+            }
+        });
+
+        ui.separator();
+
+        // File listing
+        if self.local_files.is_empty() {
+            ui.label(RichText::new("Empty directory or no access").weak());
+        } else {
+            let mut nav_to: Option<String> = None;
+            let files_snapshot = self.local_files.clone();
+
+            for (idx, entry) in files_snapshot.iter().enumerate() {
+                let is_selected = self.selected_local_idx == Some(idx);
+                let icon = if entry.is_dir { "📂" } else { "📄" };
+
+                let label_text = if entry.is_dir {
+                    format!("{} {}/", icon, entry.name)
+                } else {
+                    format!(
+                        "{} {} ({})",
+                        icon,
+                        entry.name,
+                        format_size(entry.size)
+                    )
+                };
+
+                let response = ui.selectable_label(is_selected, RichText::new(&label_text));
+
+                if response.clicked() {
+                    if entry.is_dir {
+                        nav_to = Some(entry.path.clone());
+                    } else {
+                        self.selected_local_idx = Some(idx);
+                    }
+                }
+            }
+
+            if let Some(path) = nav_to {
+                self.local_browse_path = path;
+                self.refresh_local_files();
+            }
+        }
+
+        ui.add_space(8.0);
+
+        // ─── Action buttons for selected local file ───
+        if let Some(sel_idx) = self.selected_local_idx {
+            if let Some(selected) = self.local_files.get(sel_idx) {
+                if !selected.is_dir {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("📄 {}", selected.name)).strong(),
+                            );
+                            ui.label(
+                                RichText::new(format_size(selected.size))
+                                    .weak()
+                                    .small(),
+                            );
+                        });
+
+                        ui.horizontal(|ui| {
+                            if ui.button("📤 Send to Desktop").clicked() {
+                                // One-shot send: upload to the server CWD
+                                if let Some(ref cwd) = self.client.server_cwd {
+                                    let remote = format!("{}/{}", cwd, selected.name);
+                                    *do_upload = Some((selected.path.clone(), remote));
+                                }
+                            }
+                            if ui.button("🔄 Sync with Desktop").clicked() {
+                                // Start the sync flow: pick remote destination
+                                self.sync_local_file = Some(selected.path.clone());
+                                self.sync_step = SyncStep::PickRemoteDest;
+                                // Ensure we have the remote file browser ready
+                                if !self.browse_fetched {
+                                    self.client.browse(None);
+                                    self.browse_fetched = true;
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+        }
+    }
+
+    fn draw_sync_pick_remote(
+        &mut self,
+        ui: &mut egui::Ui,
+        do_browse: &mut Option<Option<String>>,
+        do_create_sync: &mut Option<(String, String)>,
+    ) {
+        // Header with back button
+        ui.horizontal(|ui| {
+            if ui.button("← Back").clicked() {
+                self.sync_step = SyncStep::BrowseLocal;
+                self.sync_local_file = None;
+            }
+            ui.heading("Choose Destination");
+        });
+
+        if let Some(ref local_file) = self.sync_local_file.clone() {
+            let filename = local_file
+                .rsplit('/')
+                .next()
+                .unwrap_or(local_file);
+            ui.label(
+                RichText::new(format!("Syncing: {}", filename))
+                    .color(Color32::from_rgb(46, 204, 113)),
+            );
+        }
+
+        ui.add_space(4.0);
+
+        // ─── Remote Navigation bar ───
+        ui.horizontal(|ui| {
             if ui.button("⬆ Up").clicked() {
                 if let Some(pos) = self.browse_path_input.rfind('/') {
                     self.browse_path_input.truncate(pos);
@@ -728,7 +1405,6 @@ impl Renderer {
                 self.selected_remote_idx = None;
             }
 
-            // Home button (server CWD)
             if ui.button("🏠").clicked() {
                 if let Some(ref cwd) = self.client.server_cwd {
                     self.browse_path_input = cwd.clone();
@@ -737,7 +1413,6 @@ impl Renderer {
                 }
             }
 
-            // Refresh button
             if ui.button("⟳").clicked() {
                 let path = if self.browse_path_input.is_empty() {
                     None
@@ -749,7 +1424,6 @@ impl Renderer {
 
             ui.separator();
 
-            // Path text edit
             let re = ui.add(
                 egui::TextEdit::singleline(&mut self.browse_path_input)
                     .desired_width(ui.available_width()),
@@ -765,7 +1439,6 @@ impl Renderer {
             }
         });
 
-        // ─── Status / toast ───
         if let Some(ref status) = self.client.browse_status {
             let color = if status.starts_with('✓') {
                 Color32::from_rgb(46, 204, 113)
@@ -777,13 +1450,12 @@ impl Renderer {
 
         ui.separator();
 
-        // ─── Directory contents ───
+        // ─── Remote directory listing ───
         if self.client.remote_files.is_empty() && !self.client.connected {
             ui.label(RichText::new("Not connected — waiting for server…").weak());
         } else if self.client.remote_files.is_empty() {
             ui.label(RichText::new("Empty directory").weak());
         } else {
-            // Collect directories and files, sorted
             let mut dir_indices: Vec<usize> = Vec::new();
             let mut file_indices: Vec<usize> = Vec::new();
             for (i, f) in self.client.remote_files.iter().enumerate() {
@@ -806,7 +1478,6 @@ impl Renderer {
                     .cmp(&self.client.remote_files[b].name.to_lowercase())
             });
 
-            // Build combined sorted index list: dirs first, then files
             let sorted: Vec<usize> = dir_indices
                 .iter()
                 .chain(file_indices.iter())
@@ -817,7 +1488,6 @@ impl Renderer {
 
             for &idx in &sorted {
                 let entry = &self.client.remote_files[idx];
-                let is_selected = self.selected_remote_idx == Some(idx);
                 let icon = if entry.is_dir { "📂" } else { "📄" };
 
                 let label_text = if entry.is_dir {
@@ -831,12 +1501,10 @@ impl Renderer {
                     )
                 };
 
-                let response =
-                    ui.selectable_label(is_selected, RichText::new(&label_text));
+                let response = ui.selectable_label(false, RichText::new(&label_text));
 
                 if response.clicked() {
                     if entry.is_dir {
-                        // Navigate into directory
                         let new_path = if self.browse_path_input.is_empty()
                             || self.browse_path_input == "/"
                         {
@@ -845,61 +1513,41 @@ impl Renderer {
                             format!("{}/{}", self.browse_path_input, entry.name)
                         };
                         nav_to = Some(new_path);
-                    } else {
-                        // Select the file
-                        self.selected_remote_idx = Some(idx);
                     }
                 }
             }
 
-            // Apply directory navigation (deferred to avoid borrow conflicts)
             if let Some(new_path) = nav_to {
                 self.browse_path_input = new_path.clone();
                 *do_browse = Some(Some(new_path));
-                self.selected_remote_idx = None;
             }
         }
 
         ui.add_space(8.0);
 
-        // ─── Action buttons for selected file ───
-        if let Some(sel_idx) = self.selected_remote_idx {
-            if let Some(selected) = self.client.remote_files.get(sel_idx) {
-                if !selected.is_dir {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("📄 {}", selected.name)).strong(),
-                            );
-                            ui.label(
-                                RichText::new(format_size(selected.size as u64))
-                                    .weak()
-                                    .small(),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "Modified: {}",
-                                    format_timestamp(selected.modified)
-                                ))
-                                .weak()
-                                .small(),
-                            );
-                        });
-                        if ui.button("📥 Pull File").clicked() {
-                            // Build the full path for the pull request
-                            let full_path = if self.browse_path_input.is_empty()
-                                || self.browse_path_input == "/"
-                            {
-                                format!("/{}", selected.name)
-                            } else {
-                                format!("{}/{}", self.browse_path_input, selected.name)
-                            };
-                            *file_to_pull = Some(full_path);
-                        }
-                    });
+        // ─── "Sync Here" button ───
+        ui.group(|ui| {
+            ui.label(
+                RichText::new(format!("Destination: {}/", self.browse_path_input))
+                    .strong(),
+            );
+            if ui.button("🔄 Sync to This Folder").clicked() {
+                if let Some(ref local_file) = self.sync_local_file.clone() {
+                    let filename = local_file
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(local_file);
+                    let remote_path = if self.browse_path_input.is_empty()
+                        || self.browse_path_input == "/"
+                    {
+                        format!("/{}", filename)
+                    } else {
+                        format!("{}/{}", self.browse_path_input, filename)
+                    };
+                    *do_create_sync = Some((local_file.clone(), remote_path));
                 }
             }
-        }
+        });
     }
 }
 

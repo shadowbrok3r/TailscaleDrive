@@ -30,6 +30,33 @@ pub struct RemoteFile {
     pub modified: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub id: String,
+    pub hostname: String,
+    pub dns_name: String,
+    pub ip_addresses: Vec<String>,
+    pub online: bool,
+    pub os: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct SyncProject {
+    pub id: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub last_synced: u64,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncChange {
+    pub id: String,
+    pub remote_path: String,
+    pub local_path: String,
+    pub new_modified: u64,
+}
+
 // ── Events / Commands ───────────────────────────────────────────────────
 
 pub enum ClientEvent {
@@ -43,15 +70,26 @@ pub enum ClientEvent {
     BrowseUpdate(Vec<RemoteFile>),
     DownloadComplete { filename: String, data: Vec<u8> },
     PullComplete { filename: String, data: Vec<u8> },
+    PeersUpdate(Vec<PeerInfo>),
+    SyncProjectsUpdate(Vec<SyncProject>),
+    SyncChangesAvailable(Vec<SyncChange>),
+    UploadComplete { remote_path: String },
+    SyncPullComplete { project_id: String, filename: String },
     Error(String),
 }
 
 pub enum ClientCommand {
     DownloadFile(String),
     DownloadLast,
-    Browse(Option<String>), // optional path
-    PullFile(String),       // pull a remote file by name
+    Browse(Option<String>),
+    PullFile(String),
     Refresh,
+    UploadFile { local_path: String, remote_dest_path: String },
+    CreateSyncProject { local_path: String, remote_path: String },
+    FetchSyncProjects,
+    DeleteSyncProject(String),
+    AckSync { id: String, timestamp: u64 },
+    CheckSyncChanges,
 }
 
 // ── Public client used by the Renderer ──────────────────────────────────
@@ -70,6 +108,14 @@ pub struct TailscaleClient {
     pub save_directory: Option<String>,
     /// Full paths to files that were just saved and are ready for the iOS share sheet.
     pub pending_share_paths: Vec<String>,
+    /// Tailscale peers from the connected desktop
+    pub peers: Vec<PeerInfo>,
+    /// Tracked sync projects
+    pub sync_projects: Vec<SyncProject>,
+    /// Sync status message for UI
+    pub sync_status: Option<String>,
+    /// Pending notifications for sync events: (title, body)
+    pub pending_sync_notifications: Vec<(String, String)>,
 
     event_rx: mpsc::Receiver<ClientEvent>,
     command_tx: mpsc::Sender<ClientCommand>,
@@ -98,6 +144,10 @@ impl TailscaleClient {
             server_cwd: None,
             save_directory: None,
             pending_share_paths: Vec::new(),
+            peers: Vec::new(),
+            sync_projects: Vec::new(),
+            sync_status: None,
+            pending_sync_notifications: Vec::new(),
             event_rx,
             command_tx,
         }
@@ -113,6 +163,7 @@ impl TailscaleClient {
                     last_received_file,
                     server_cwd,
                 } => {
+                    let was_connected = self.connected;
                     self.connected = connected;
                     self.last_sent = last_sent;
                     self.last_received_file = last_received_file;
@@ -124,6 +175,13 @@ impl TailscaleClient {
                     } else {
                         "Cannot reach server".to_string()
                     };
+                    // When we lose connection, mark all cached peers as offline
+                    // instead of wiping the list
+                    if was_connected && !connected {
+                        for peer in &mut self.peers {
+                            peer.online = false;
+                        }
+                    }
                 }
                 ClientEvent::FilesUpdate(files) => {
                     self.waiting_files = files;
@@ -161,6 +219,13 @@ impl TailscaleClient {
                         ));
                     }
                 }
+                ClientEvent::PeersUpdate(peers) => {
+                    self.peers = peers;
+                    // Cache to disk for offline access
+                    if let Some(ref dir) = self.save_directory {
+                        save_cached_peers(dir, &self.peers);
+                    }
+                }
                 ClientEvent::PullComplete { filename, data } => {
                     let size = data.len();
                     if let Some(ref dir) = self.save_directory {
@@ -189,6 +254,33 @@ impl TailscaleClient {
                         ));
                     }
                 }
+                ClientEvent::SyncProjectsUpdate(projects) => {
+                    self.sync_projects = projects;
+                }
+                ClientEvent::SyncChangesAvailable(changes) => {
+                    // Auto-pull will handle these in the poll loop
+                    if !changes.is_empty() {
+                        self.sync_status = Some(format!(
+                            "{} file(s) updated on desktop",
+                            changes.len()
+                        ));
+                    }
+                }
+                ClientEvent::UploadComplete { remote_path } => {
+                    let filename = remote_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&remote_path)
+                        .to_string();
+                    self.sync_status = Some(format!("✓ Uploaded '{}'", filename));
+                }
+                ClientEvent::SyncPullComplete { project_id: _, filename } => {
+                    self.sync_status = Some(format!("✓ Synced '{}'", filename));
+                    self.pending_sync_notifications.push((
+                        "File Synced".to_string(),
+                        format!("Updated: {}", filename),
+                    ));
+                }
                 ClientEvent::Error(msg) => {
                     self.download_status = Some(format!("✗ {}", msg));
                 }
@@ -214,6 +306,32 @@ impl TailscaleClient {
 
     pub fn refresh(&self) {
         let _ = self.command_tx.send(ClientCommand::Refresh);
+    }
+
+    pub fn upload_file(&self, local_path: &str, remote_dest_path: &str) {
+        let _ = self.command_tx.send(ClientCommand::UploadFile {
+            local_path: local_path.to_string(),
+            remote_dest_path: remote_dest_path.to_string(),
+        });
+    }
+
+    pub fn create_sync_project(&self, local_path: &str, remote_path: &str) {
+        let _ = self.command_tx.send(ClientCommand::CreateSyncProject {
+            local_path: local_path.to_string(),
+            remote_path: remote_path.to_string(),
+        });
+    }
+
+    pub fn fetch_sync_projects(&self) {
+        let _ = self.command_tx.send(ClientCommand::FetchSyncProjects);
+    }
+
+    pub fn delete_sync_project(&self, id: &str) {
+        let _ = self.command_tx.send(ClientCommand::DeleteSyncProject(id.to_string()));
+    }
+
+    pub fn check_sync_changes(&self) {
+        let _ = self.command_tx.send(ClientCommand::CheckSyncChanges);
     }
 }
 
@@ -306,6 +424,92 @@ fn poll_loop(
                     ClientCommand::Refresh => {
                         last_poll = Instant::now() - poll_interval;
                     }
+                    ClientCommand::UploadFile { local_path, remote_dest_path } => {
+                        match http_upload_file(&agent, base_url, &local_path, &remote_dest_path) {
+                            Ok(()) => {
+                                if event_tx
+                                    .send(ClientEvent::UploadComplete { remote_path: remote_dest_path })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::CreateSyncProject { local_path, remote_path } => {
+                        match http_create_sync_project(&agent, base_url, &local_path, &remote_path) {
+                            Ok(project) => {
+                                // Also save locally
+                                save_local_sync_project(&project);
+                                // Refresh projects list
+                                if let Ok(projects) = http_fetch_sync_projects(&agent, base_url) {
+                                    if event_tx.send(ClientEvent::SyncProjectsUpdate(projects)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::FetchSyncProjects => {
+                        match http_fetch_sync_projects(&agent, base_url) {
+                            Ok(projects) => {
+                                if event_tx.send(ClientEvent::SyncProjectsUpdate(projects)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::DeleteSyncProject(id) => {
+                        match http_delete_sync_project(&agent, base_url, &id) {
+                            Ok(()) => {
+                                remove_local_sync_project(&id);
+                                if let Ok(projects) = http_fetch_sync_projects(&agent, base_url) {
+                                    if event_tx.send(ClientEvent::SyncProjectsUpdate(projects)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::AckSync { id, timestamp } => {
+                        let _ = http_sync_ack(&agent, base_url, &id, timestamp);
+                    }
+                    ClientCommand::CheckSyncChanges => {
+                        match http_sync_check(&agent, base_url) {
+                            Ok(changes) => {
+                                if !changes.is_empty() {
+                                    if event_tx.send(ClientEvent::SyncChangesAvailable(changes)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 },
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return, // client dropped
@@ -348,6 +552,76 @@ fn poll_loop(
             if let Ok(files) = http_fetch_files(&agent, base_url) {
                 if event_tx.send(ClientEvent::FilesUpdate(files)).is_err() {
                     return;
+                }
+            }
+
+            if let Ok(peers) = http_fetch_peers(&agent, base_url) {
+                if event_tx.send(ClientEvent::PeersUpdate(peers)).is_err() {
+                    return;
+                }
+            }
+
+            // ── Auto-sync: check for remote changes and pull them ──
+            if let Ok(changes) = http_sync_check(&agent, base_url) {
+                for change in &changes {
+                    // Pull the changed file from desktop
+                    if let Ok((filename, data)) = http_pull_remote_file(&agent, base_url, &change.local_path) {
+                        // The change.remote_path is the iOS local path
+                        // Save to that path
+                        if std::fs::write(&change.remote_path, &data).is_ok() {
+                            // Acknowledge the sync
+                            let _ = http_sync_ack(&agent, base_url, &change.id, change.new_modified);
+                            if event_tx
+                                .send(ClientEvent::SyncPullComplete {
+                                    project_id: change.id.clone(),
+                                    filename,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Auto-sync: check for local changes and push them ──
+            if let Ok(projects) = http_fetch_sync_projects(&agent, base_url) {
+                for project in &projects {
+                    if project.paused {
+                        continue;
+                    }
+                    // project.remote_path is the iOS local path (from desktop's perspective)
+                    let ios_path = &project.remote_path;
+                    if let Ok(metadata) = std::fs::metadata(ios_path) {
+                        let modified = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if modified > project.last_synced {
+                            // File changed locally on iOS, push to desktop
+                            if http_upload_file(&agent, base_url, ios_path, &project.local_path).is_ok() {
+                                // Update last_synced
+                                let _ = http_sync_ack(&agent, base_url, &project.id, modified);
+                                let filename = ios_path
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(ios_path)
+                                    .to_string();
+                                if event_tx
+                                    .send(ClientEvent::SyncPullComplete {
+                                        project_id: project.id.clone(),
+                                        filename,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -475,6 +749,19 @@ fn http_download_last(agent: &ureq::Agent, base_url: &str) -> Result<(String, Ve
     Ok((name, data))
 }
 
+fn http_fetch_peers(agent: &ureq::Agent, base_url: &str) -> Result<Vec<PeerInfo>, String> {
+    let url = format!("{}/peers", base_url);
+    let body = agent
+        .get(&url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+
+    let peers: Vec<PeerInfo> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    Ok(peers)
+}
+
 /// GET /pull?path=<filepath> — download an arbitrary file from the server's filesystem
 fn http_pull_remote_file(
     agent: &ureq::Agent,
@@ -509,6 +796,172 @@ fn http_pull_remote_file(
         .read_to_end(&mut data)
         .map_err(|e| e.to_string())?;
     Ok((name, data))
+}
+
+// ── Sync HTTP helpers ───────────────────────────────────────────────
+
+fn http_upload_file(
+    agent: &ureq::Agent,
+    base_url: &str,
+    local_path: &str,
+    remote_dest_path: &str,
+) -> Result<(), String> {
+    let data = std::fs::read(local_path)
+        .map_err(|e| format!("Failed to read '{}': {}", local_path, e))?;
+
+    let url = format!("{}/sync/upload", base_url);
+    agent
+        .put(&url)
+        .query("path", remote_dest_path)
+        .send_bytes(&data)
+        .map_err(|e| format!("upload failed: {}", e))?;
+
+    Ok(())
+}
+
+fn http_create_sync_project(
+    agent: &ureq::Agent,
+    base_url: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<SyncProject, String> {
+    let url = format!("{}/sync/projects", base_url);
+    // Note: from the desktop's perspective, local_path is the desktop path (remote_path here)
+    // and remote_path is the iOS path (local_path here)
+    let body = serde_json::json!({
+        "local_path": remote_path,
+        "remote_path": local_path,
+    });
+    let resp = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("create sync project failed: {}", e))?;
+
+    let text = resp.into_string().map_err(|e| e.to_string())?;
+    let project: SyncProject = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(project)
+}
+
+fn http_fetch_sync_projects(
+    agent: &ureq::Agent,
+    base_url: &str,
+) -> Result<Vec<SyncProject>, String> {
+    let url = format!("{}/sync/projects", base_url);
+    let body = agent
+        .get(&url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+
+    let projects: Vec<SyncProject> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    Ok(projects)
+}
+
+fn http_delete_sync_project(
+    agent: &ureq::Agent,
+    base_url: &str,
+    id: &str,
+) -> Result<(), String> {
+    let url = format!("{}/sync/projects/{}", base_url, id);
+    agent
+        .delete(&url)
+        .call()
+        .map_err(|e| format!("delete sync project failed: {}", e))?;
+    Ok(())
+}
+
+fn http_sync_check(
+    agent: &ureq::Agent,
+    base_url: &str,
+) -> Result<Vec<SyncChange>, String> {
+    let url = format!("{}/sync/check", base_url);
+    let body = agent
+        .get(&url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+
+    let changes: Vec<SyncChange> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    Ok(changes)
+}
+
+fn http_sync_ack(
+    agent: &ureq::Agent,
+    base_url: &str,
+    id: &str,
+    timestamp: u64,
+) -> Result<(), String> {
+    let url = format!("{}/sync/ack", base_url);
+    let body = serde_json::json!({ "id": id, "timestamp": timestamp });
+    agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("sync ack failed: {}", e))?;
+    Ok(())
+}
+
+// ── Peer caching (iOS side) ─────────────────────────────────────────
+
+fn cached_peers_path(save_dir: &str) -> String {
+    // Go up from "Downloads" to "Documents" for the cache file
+    if let Some(parent) = std::path::Path::new(save_dir).parent() {
+        format!("{}/cached_peers.json", parent.to_string_lossy())
+    } else {
+        format!("{}/cached_peers.json", save_dir)
+    }
+}
+
+pub fn load_cached_peers(save_dir: &str) -> Vec<PeerInfo> {
+    let path = cached_peers_path(save_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_cached_peers(save_dir: &str, peers: &[PeerInfo]) {
+    let path = cached_peers_path(save_dir);
+    if let Ok(data) = serde_json::to_string_pretty(peers) {
+        let _ = std::fs::write(&path, data);
+    }
+}
+
+// ── Local sync project persistence (iOS side) ──────────────────────
+
+fn local_sync_projects_path() -> Option<String> {
+    // Use the app's Documents directory
+    // This will be set via save_directory, but for persistence we go up one level
+    None // Will be computed from save_directory at runtime
+}
+
+fn load_local_sync_projects_from(dir: &str) -> Vec<SyncProject> {
+    let path = format!("{}/sync_projects.json", dir);
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_local_sync_projects_to(dir: &str, projects: &[SyncProject]) {
+    let path = format!("{}/sync_projects.json", dir);
+    if let Ok(data) = serde_json::to_string_pretty(projects) {
+        let _ = std::fs::write(&path, data);
+    }
+}
+
+fn save_local_sync_project(project: &SyncProject) {
+    // We'll save to a well-known location; the renderer will call with save_directory
+    // For now, store in a static-like approach using /tmp as fallback
+    // The real persistence is handled when we have save_directory
+    let _ = project; // will be saved via the renderer's save flow
+}
+
+fn remove_local_sync_project(id: &str) {
+    let _ = id; // will be handled via the renderer's save flow
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────

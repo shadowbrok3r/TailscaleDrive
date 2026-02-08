@@ -125,12 +125,13 @@ struct EguiView: UIViewRepresentable {
             hostView = view
 
             // Tell Rust where to save downloaded / pulled files
-            if let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-                // Create a "Downloads" subfolder so it's tidy
-                let dlDir = docsDir.appendingPathComponent("Downloads")
-                try? FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+            do {
+                let dlDir = try AppFiles.downloadsDirectory()
                 renderer?.setSaveDirectory(dlDir.path)
+            } catch {
+                print("[Storage] Failed to set Downloads directory: \(error)")
             }
+
 
             // ── Wire up touch callbacks ──
             view.onTouch = { [weak self] phase, pt in

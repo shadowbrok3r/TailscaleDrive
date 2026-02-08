@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{StatusCode, header},
     response::Response,
-    routing::{get, put},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use tokio_util::io::ReaderStream;
@@ -40,12 +40,48 @@ pub struct ReceivedState {
 pub struct AppState {
     pub last_sent: Arc<Mutex<Option<SentFileInfo>>>,
     pub received: Arc<Mutex<ReceivedState>>,
+    pub peers: Arc<Mutex<Vec<crate::app_state::TailscalePeer>>>,
+    pub sync_projects: Arc<Mutex<Vec<crate::app_state::SyncProject>>>,
 }
 
 pub fn new_app_state() -> AppState {
+    let projects = load_sync_projects();
     AppState {
         last_sent: Arc::new(Mutex::new(None)),
         received: Arc::new(Mutex::new(ReceivedState::default())),
+        peers: Arc::new(Mutex::new(Vec::new())),
+        sync_projects: Arc::new(Mutex::new(projects)),
+    }
+}
+
+// --- Sync project persistence ---
+
+fn sync_projects_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".config")
+        .join("tailscale-drive")
+        .join("sync_projects.json")
+}
+
+pub fn load_sync_projects() -> Vec<crate::app_state::SyncProject> {
+    let path = sync_projects_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn save_sync_projects(projects: &[crate::app_state::SyncProject]) {
+    let path = sync_projects_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(data) = serde_json::to_string_pretty(projects) {
+        let _ = std::fs::write(&path, data);
     }
 }
 
@@ -161,6 +197,26 @@ async fn download_last_handler(
     };
 
     download_file_handler(State(state), Path(name)).await
+}
+
+/// GET /peers — list all Tailscale peers on the network
+async fn peers_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let peers = state.peers.lock().unwrap();
+    let result: Vec<serde_json::Value> = peers
+        .iter()
+        .filter(|p| !p.is_self)
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "hostname": p.hostname,
+                "dns_name": p.dns_name,
+                "ip_addresses": p.ip_addresses,
+                "online": p.online,
+                "os": p.os,
+            })
+        })
+        .collect();
+    Json(serde_json::json!(result))
 }
 
 // --- Browse / Upload ---
@@ -280,6 +336,152 @@ async fn upload_handler(
     Ok(StatusCode::OK)
 }
 
+// --- Sync endpoints ---
+
+/// GET /sync/projects — list all sync projects
+async fn sync_list_projects(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::app_state::SyncProject>> {
+    let projects = state.sync_projects.lock().unwrap();
+    Json(projects.clone())
+}
+
+#[derive(SerdeDeserialize)]
+struct CreateSyncProjectRequest {
+    local_path: String,
+    remote_path: String,
+}
+
+/// POST /sync/projects — create a new sync project
+async fn sync_create_project(
+    State(state): State<AppState>,
+    Json(body): Json<CreateSyncProjectRequest>,
+) -> Result<Json<crate::app_state::SyncProject>, (StatusCode, String)> {
+    let project = crate::app_state::SyncProject {
+        id: format!("{:x}", rand_id()),
+        local_path: body.local_path,
+        remote_path: body.remote_path,
+        last_synced: unix_timestamp(),
+        paused: false,
+    };
+
+    let mut projects = state.sync_projects.lock().unwrap();
+    projects.push(project.clone());
+    save_sync_projects(&projects);
+    log::info!("Created sync project: {} -> {}", project.local_path, project.remote_path);
+    Ok(Json(project))
+}
+
+/// DELETE /sync/projects/{id} — remove a sync project
+async fn sync_delete_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut projects = state.sync_projects.lock().unwrap();
+    let before = projects.len();
+    projects.retain(|p| p.id != id);
+    if projects.len() == before {
+        return Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", id)));
+    }
+    save_sync_projects(&projects);
+    log::info!("Deleted sync project: {}", id);
+    Ok(StatusCode::OK)
+}
+
+#[derive(Serialize)]
+struct SyncChangeResponse {
+    id: String,
+    remote_path: String,
+    local_path: String,
+    new_modified: u64,
+}
+
+/// GET /sync/check — return projects where the desktop file has been modified since last sync
+async fn sync_check(
+    State(state): State<AppState>,
+) -> Json<Vec<SyncChangeResponse>> {
+    let projects = state.sync_projects.lock().unwrap();
+    let mut changes = Vec::new();
+    for project in projects.iter() {
+        if project.paused {
+            continue;
+        }
+        let path = std::path::Path::new(&project.local_path);
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if modified > project.last_synced {
+                changes.push(SyncChangeResponse {
+                    id: project.id.clone(),
+                    remote_path: project.remote_path.clone(),
+                    local_path: project.local_path.clone(),
+                    new_modified: modified,
+                });
+            }
+        }
+    }
+    Json(changes)
+}
+
+#[derive(SerdeDeserialize)]
+struct SyncAckRequest {
+    id: String,
+    timestamp: u64,
+}
+
+/// POST /sync/ack — iOS confirms it pulled a file; updates last_synced
+async fn sync_ack(
+    State(state): State<AppState>,
+    Json(body): Json<SyncAckRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut projects = state.sync_projects.lock().unwrap();
+    if let Some(project) = projects.iter_mut().find(|p| p.id == body.id) {
+        project.last_synced = body.timestamp;
+        save_sync_projects(&projects);
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("Project '{}' not found", body.id)))
+    }
+}
+
+#[derive(SerdeDeserialize)]
+struct SyncUploadQuery {
+    path: String,
+}
+
+/// PUT /sync/upload?path=<absolute_path> — upload a file to an absolute path on the desktop
+async fn sync_upload_handler(
+    Query(params): Query<SyncUploadQuery>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let dest = std::path::PathBuf::from(&params.path);
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    std::fs::write(&dest, &body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    log::info!("Sync upload: {}", params.path);
+    Ok(StatusCode::OK)
+}
+
+/// Simple random ID generator (no external crate needed)
+fn rand_id() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish()
+}
+
 // --- Server ---
 
 pub async fn run_status_server(state: AppState) -> anyhow::Result<()> {
@@ -291,6 +493,12 @@ pub async fn run_status_server(state: AppState) -> anyhow::Result<()> {
         .route("/browse", get(browse_handler))
         .route("/pull", get(pull_file_handler))
         .route("/upload/{*path}", put(upload_handler))
+        .route("/peers", get(peers_handler))
+        .route("/sync/projects", get(sync_list_projects).post(sync_create_project))
+        .route("/sync/projects/{id}", delete(sync_delete_project))
+        .route("/sync/check", get(sync_check))
+        .route("/sync/ack", post(sync_ack))
+        .route("/sync/upload", put(sync_upload_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
