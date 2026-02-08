@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -342,10 +341,11 @@ fn poll_loop(
     event_tx: mpsc::Sender<ClientEvent>,
     command_rx: mpsc::Receiver<ClientCommand>,
 ) {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(8))
-        .timeout_write(Duration::from_secs(8))
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
         .build();
+
+    let agent = config.into();
 
     let poll_interval = Duration::from_secs(3);
     let mut last_poll = Instant::now() - poll_interval; // poll immediately on start
@@ -641,7 +641,8 @@ fn http_fetch_status(
         .get(&url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -679,7 +680,8 @@ fn http_fetch_files(agent: &ureq::Agent, base_url: &str) -> Result<Vec<WaitingFi
         .get(&url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
 
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -706,7 +708,8 @@ fn http_fetch_browse(
     let body = req
         .call()
         .map_err(|e| format!("browse request failed: {}", e))?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
 
     let files: Vec<RemoteFile> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -719,21 +722,23 @@ fn http_download_file(
     name: &str,
 ) -> Result<Vec<u8>, String> {
     let url = format!("{}/download/{}", base_url, name);
-    let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
-    let mut data = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut data)
+    let mut resp = agent.get(&url).call().map_err(|e| e.to_string())?;
+    let data = resp.body_mut()
+        .read_to_vec()
         .map_err(|e| e.to_string())?;
+    
     Ok(data)
 }
 
 fn http_download_last(agent: &ureq::Agent, base_url: &str) -> Result<(String, Vec<u8>), String> {
     let url = format!("{}/download", base_url);
-    let resp = agent.get(&url).call().map_err(|e| e.to_string())?;
+    let mut resp = agent.get(&url).call().map_err(|e| e.to_string())?;
 
     // Try to get filename from Content-Disposition header
     let name = resp
-        .header("content-disposition")
+        .headers()
+        .get("content-disposition")
+        .and_then(|cd| cd.to_str().ok())
         .and_then(|cd| {
             cd.split("filename=\"")
                 .nth(1)
@@ -742,10 +747,10 @@ fn http_download_last(agent: &ureq::Agent, base_url: &str) -> Result<(String, Ve
         .unwrap_or("downloaded_file")
         .to_string();
 
-    let mut data = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut data)
+     let data =resp.body_mut()
+        .read_to_vec()
         .map_err(|e| e.to_string())?;
+
     Ok((name, data))
 }
 
@@ -755,7 +760,8 @@ fn http_fetch_peers(agent: &ureq::Agent, base_url: &str) -> Result<Vec<PeerInfo>
         .get(&url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
 
     let peers: Vec<PeerInfo> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -769,7 +775,7 @@ fn http_pull_remote_file(
     path: &str,
 ) -> Result<(String, Vec<u8>), String> {
     let url = format!("{}/pull", base_url);
-    let resp = agent
+    let mut resp = agent
         .get(&url)
         .query("path", path)
         .call()
@@ -777,7 +783,9 @@ fn http_pull_remote_file(
 
     // Try to get filename from Content-Disposition header, fall back to path basename
     let name = resp
-        .header("content-disposition")
+        .headers()
+        .get("content-disposition")
+        .and_then(|cd| cd.to_str().ok())
         .and_then(|cd| {
             cd.split("filename=\"")
                 .nth(1)
@@ -791,10 +799,10 @@ fn http_pull_remote_file(
                 .to_string()
         });
 
-    let mut data = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut data)
+    let data = resp.body_mut()
+        .read_to_vec()
         .map_err(|e| e.to_string())?;
+
     Ok((name, data))
 }
 
@@ -813,7 +821,7 @@ fn http_upload_file(
     agent
         .put(&url)
         .query("path", remote_dest_path)
-        .send_bytes(&data)
+        .send(&data)
         .map_err(|e| format!("upload failed: {}", e))?;
 
     Ok(())
@@ -832,13 +840,16 @@ fn http_create_sync_project(
         "local_path": remote_path,
         "remote_path": local_path,
     });
-    let resp = agent
+
+    let mut resp = agent
         .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .header("Content-Type", "application/json")
+        .send(&body.to_string())
         .map_err(|e| format!("create sync project failed: {}", e))?;
 
-    let text = resp.into_string().map_err(|e| e.to_string())?;
+    let text = resp.body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
     let project: SyncProject = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     Ok(project)
 }
@@ -852,7 +863,8 @@ fn http_fetch_sync_projects(
         .get(&url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
 
     let projects: Vec<SyncProject> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -881,7 +893,8 @@ fn http_sync_check(
         .get(&url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())?;
 
     let changes: Vec<SyncChange> = serde_json::from_str(&body).map_err(|e| e.to_string())?;
@@ -898,8 +911,8 @@ fn http_sync_ack(
     let body = serde_json::json!({ "id": id, "timestamp": timestamp });
     agent
         .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
+        .header("Content-Type", "application/json")
+        .send(&body.to_string())
         .map_err(|e| format!("sync ack failed: {}", e))?;
     Ok(())
 }

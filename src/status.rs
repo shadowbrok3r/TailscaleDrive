@@ -204,7 +204,6 @@ async fn peers_handler(State(state): State<AppState>) -> Json<serde_json::Value>
     let peers = state.peers.lock().unwrap();
     let result: Vec<serde_json::Value> = peers
         .iter()
-        .filter(|p| !p.is_self)
         .map(|p| {
             serde_json::json!({
                 "id": p.id,
