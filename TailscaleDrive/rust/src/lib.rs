@@ -30,6 +30,15 @@ mod ffi {
         fn renderer_insert_text(ptr: *mut c_void, text: String);
         fn renderer_delete_backward(ptr: *mut c_void);
 
+        // iPad hardware keyboard support
+        fn renderer_key_event(ptr: *mut c_void, key_code: i32, modifier_flags: i32, pressed: bool);
+
+        // iPad trackpad / mouse scroll support
+        fn renderer_scroll(ptr: *mut c_void, dx: f32, dy: f32);
+
+        // iPad trackpad hover (pointer moved without click)
+        fn renderer_pointer_moved(ptr: *mut c_void, x_pt: f32, y_pt: f32);
+
         // Save directory & share sheet
         fn renderer_set_save_directory(ptr: *mut c_void, path: String);
         fn renderer_has_pending_share(ptr: *mut c_void) -> bool;
@@ -135,6 +144,31 @@ pub fn renderer_delete_backward(ptr: *mut c_void) {
         return;
     }
     unsafe { &mut *(ptr as *mut Renderer) }.delete_backward();
+}
+
+// ── iPad hardware keyboard bridge functions ───────────────────────────
+
+pub fn renderer_key_event(ptr: *mut c_void, key_code: i32, modifier_flags: i32, pressed: bool) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe { &mut *(ptr as *mut Renderer) }.key_event(key_code, modifier_flags, pressed);
+}
+
+// ── iPad trackpad / mouse scroll bridge functions ─────────────────────
+
+pub fn renderer_scroll(ptr: *mut c_void, dx: f32, dy: f32) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe { &mut *(ptr as *mut Renderer) }.scroll_event(dx, dy);
+}
+
+pub fn renderer_pointer_moved(ptr: *mut c_void, x_pt: f32, y_pt: f32) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe { &mut *(ptr as *mut Renderer) }.pointer_moved(x_pt, y_pt);
 }
 
 // ── Save directory & share sheet bridge functions ─────────────────────

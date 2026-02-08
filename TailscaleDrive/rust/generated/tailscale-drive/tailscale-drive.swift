@@ -40,6 +40,15 @@ public func renderer_insert_text<GenericIntoRustString: IntoRustString>(_ ptr: U
 public func renderer_delete_backward(_ ptr: UnsafeMutableRawPointer) {
     __swift_bridge__$renderer_delete_backward(ptr)
 }
+public func renderer_key_event(_ ptr: UnsafeMutableRawPointer, _ key_code: Int32, _ modifier_flags: Int32, _ pressed: Bool) {
+    __swift_bridge__$renderer_key_event(ptr, key_code, modifier_flags, pressed)
+}
+public func renderer_scroll(_ ptr: UnsafeMutableRawPointer, _ dx: Float, _ dy: Float) {
+    __swift_bridge__$renderer_scroll(ptr, dx, dy)
+}
+public func renderer_pointer_moved(_ ptr: UnsafeMutableRawPointer, _ x_pt: Float, _ y_pt: Float) {
+    __swift_bridge__$renderer_pointer_moved(ptr, x_pt, y_pt)
+}
 public func renderer_set_save_directory<GenericIntoRustString: IntoRustString>(_ ptr: UnsafeMutableRawPointer, _ path: GenericIntoRustString) {
     __swift_bridge__$renderer_set_save_directory(ptr, { let rustString = path.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
 }

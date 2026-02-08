@@ -310,6 +310,45 @@ impl Renderer {
         });
     }
 
+    // ── iPad hardware keyboard support ────────────────────────────────
+
+    /// Called from Swift's pressesBegan/pressesEnded — forwards hardware key events to egui.
+    /// key_code: UIKeyboardHIDUsage raw value
+    /// modifier_flags: UIKeyModifierFlags raw value
+    /// pressed: true for key down, false for key up
+    pub fn key_event(&mut self, key_code: i32, modifier_flags: i32, pressed: bool) {
+        let modifiers = ios_modifiers_to_egui(modifier_flags);
+
+        if let Some(key) = hid_to_egui_key(key_code) {
+            self.pending_events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            });
+        }
+    }
+
+    // ── iPad trackpad / mouse scroll support ──────────────────────────
+
+    /// Called from Swift's UIPanGestureRecognizer for trackpad scroll events.
+    /// dx, dy are the scroll deltas in points.
+    pub fn scroll_event(&mut self, dx: f32, dy: f32) {
+        self.pending_events
+            .push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(dx, dy),
+                modifiers: egui::Modifiers::default(),
+            });
+    }
+
+    /// Called from Swift's UIHoverGestureRecognizer — trackpad pointer hover.
+    pub fn pointer_moved(&mut self, x_pt: f32, y_pt: f32) {
+        self.pending_events
+            .push(egui::Event::PointerMoved(pos2(x_pt, y_pt)));
+    }
+
     // ── Main render ─────────────────────────────────────────────────────
 
     pub fn render(&mut self, time_seconds: f64) {
@@ -1549,6 +1588,118 @@ impl Renderer {
                 }
             }
         });
+    }
+}
+
+// ── iPad hardware key mapping ───────────────────────────────────────────
+
+/// Map iOS UIKeyModifierFlags raw value to egui Modifiers.
+fn ios_modifiers_to_egui(flags: i32) -> egui::Modifiers {
+    let flags = flags as u32;
+    let shift = flags & (1 << 17) != 0; // UIKeyModifierFlags.shift
+    let ctrl = flags & (1 << 18) != 0; // UIKeyModifierFlags.control
+    let alt = flags & (1 << 19) != 0; // UIKeyModifierFlags.alternate (Option key)
+    let cmd = flags & (1 << 20) != 0; // UIKeyModifierFlags.command
+
+    egui::Modifiers {
+        alt,
+        ctrl,
+        shift,
+        mac_cmd: cmd,
+        command: cmd, // On iOS, Command is the platform's action modifier
+    }
+}
+
+/// Map iOS UIKeyboardHIDUsage raw value to egui Key.
+fn hid_to_egui_key(code: i32) -> Option<egui::Key> {
+    use egui::Key;
+    match code {
+        // Letters A-Z (HID 0x04 – 0x1D)
+        0x04 => Some(Key::A),
+        0x05 => Some(Key::B),
+        0x06 => Some(Key::C),
+        0x07 => Some(Key::D),
+        0x08 => Some(Key::E),
+        0x09 => Some(Key::F),
+        0x0A => Some(Key::G),
+        0x0B => Some(Key::H),
+        0x0C => Some(Key::I),
+        0x0D => Some(Key::J),
+        0x0E => Some(Key::K),
+        0x0F => Some(Key::L),
+        0x10 => Some(Key::M),
+        0x11 => Some(Key::N),
+        0x12 => Some(Key::O),
+        0x13 => Some(Key::P),
+        0x14 => Some(Key::Q),
+        0x15 => Some(Key::R),
+        0x16 => Some(Key::S),
+        0x17 => Some(Key::T),
+        0x18 => Some(Key::U),
+        0x19 => Some(Key::V),
+        0x1A => Some(Key::W),
+        0x1B => Some(Key::X),
+        0x1C => Some(Key::Y),
+        0x1D => Some(Key::Z),
+
+        // Digits 1–9, 0 (HID 0x1E – 0x27)
+        0x1E => Some(Key::Num1),
+        0x1F => Some(Key::Num2),
+        0x20 => Some(Key::Num3),
+        0x21 => Some(Key::Num4),
+        0x22 => Some(Key::Num5),
+        0x23 => Some(Key::Num6),
+        0x24 => Some(Key::Num7),
+        0x25 => Some(Key::Num8),
+        0x26 => Some(Key::Num9),
+        0x27 => Some(Key::Num0),
+
+        // Special keys
+        0x28 => Some(Key::Enter),
+        0x29 => Some(Key::Escape),
+        0x2A => Some(Key::Backspace),
+        0x2B => Some(Key::Tab),
+        0x2C => Some(Key::Space),
+
+        // Punctuation / symbols
+        0x2D => Some(Key::Minus),  // Hyphen / Minus
+        0x2E => Some(Key::Equals), // Equal sign / Plus
+        0x2F => Some(Key::OpenBracket),
+        0x30 => Some(Key::CloseBracket),
+        0x31 => Some(Key::Backslash),
+        0x33 => Some(Key::Semicolon),
+        0x34 => Some(Key::Quote), // Apostrophe
+        0x35 => Some(Key::Backtick),
+        0x36 => Some(Key::Comma),
+        0x37 => Some(Key::Period),
+        0x38 => Some(Key::Slash),
+
+        // Navigation
+        0x4A => Some(Key::Home),
+        0x4B => Some(Key::PageUp),
+        0x4C => Some(Key::Delete), // Forward delete
+        0x4D => Some(Key::End),
+        0x4E => Some(Key::PageDown),
+        0x4F => Some(Key::ArrowRight),
+        0x50 => Some(Key::ArrowLeft),
+        0x51 => Some(Key::ArrowDown),
+        0x52 => Some(Key::ArrowUp),
+
+        // Function keys
+        0x3A => Some(Key::F1),
+        0x3B => Some(Key::F2),
+        0x3C => Some(Key::F3),
+        0x3D => Some(Key::F4),
+        0x3E => Some(Key::F5),
+        0x3F => Some(Key::F6),
+        0x40 => Some(Key::F7),
+        0x41 => Some(Key::F8),
+        0x42 => Some(Key::F9),
+        0x43 => Some(Key::F10),
+        0x44 => Some(Key::F11),
+        0x45 => Some(Key::F12),
+
+        _ => None,
     }
 }
 

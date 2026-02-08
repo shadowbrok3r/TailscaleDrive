@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{StatusCode, header},
     response::Response,
     routing::{delete, get, post, put},
@@ -498,6 +498,7 @@ pub async fn run_status_server(state: AppState) -> anyhow::Result<()> {
         .route("/sync/check", get(sync_check))
         .route("/sync/ack", post(sync_ack))
         .route("/sync/upload", put(sync_upload_handler))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB limit for file uploads
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;

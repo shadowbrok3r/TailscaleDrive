@@ -11,7 +11,7 @@ struct ContentView: View {
     }
 }
 
-// ── MetalHostView — UIKeyInput for iOS keyboard support ─────────────────
+// ── MetalHostView — UIKeyInput + hardware keyboard + trackpad ───────────
 
 final class MetalHostView: UIView, UIKeyInput {
     override class var layerClass: AnyClass { CAMetalLayer.self }
@@ -24,6 +24,23 @@ final class MetalHostView: UIView, UIKeyInput {
     var onTextInput: ((String) -> Void)?
     var onDeleteBackward: (() -> Void)?
 
+    // Hardware keyboard callback: (keyCode, modifierFlags, pressed)
+    var onKeyEvent: ((Int32, Int32, Bool) -> Void)?
+
+    // Trackpad scroll callback: (dx, dy) in points
+    var onScroll: ((CGFloat, CGFloat) -> Void)?
+
+    // Trackpad hover callback: (x, y) in points
+    var onHover: ((CGFloat, CGFloat) -> Void)?
+    var onHoverEnded: (() -> Void)?
+
+    // Layout change callback for dynamic resize
+    var onLayoutChange: (() -> Void)?
+
+    // Flag to avoid double-processing special keys (Enter, Tab, Backspace)
+    // when hardware keyboard sends both pressesBegan AND insertText/deleteBackward
+    private var skipNextSpecialKey = false
+
     // ── UIKeyInput ──────────────────────────────────────────────────
 
     override var canBecomeFirstResponder: Bool { true }
@@ -31,16 +48,65 @@ final class MetalHostView: UIView, UIKeyInput {
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
+        // If a hardware key event already handled this special key, skip
+        if skipNextSpecialKey && (text == "\n" || text == "\t") {
+            skipNextSpecialKey = false
+            return
+        }
+        skipNextSpecialKey = false
         onTextInput?(text)
     }
 
     func deleteBackward() {
+        // If a hardware key event already handled Backspace, skip
+        if skipNextSpecialKey {
+            skipNextSpecialKey = false
+            return
+        }
         onDeleteBackward?()
     }
 
     // Prevent the view from showing any native text selection UI
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         return false
+    }
+
+    // ── Hardware keyboard handling (iPad external keyboard) ─────────
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses {
+            guard let key = press.key else { continue }
+            let code = Int32(key.keyCode.rawValue)
+
+            // Mark special keys to prevent duplication with insertText/deleteBackward
+            // Enter = 0x28, Escape = 0x29, Backspace = 0x2A, Tab = 0x2B
+            if code == 0x28 || code == 0x29 || code == 0x2A || code == 0x2B {
+                skipNextSpecialKey = true
+            }
+
+            onKeyEvent?(code, Int32(key.modifierFlags.rawValue), true)
+        }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses {
+            guard let key = press.key else { continue }
+            onKeyEvent?(Int32(key.keyCode.rawValue), Int32(key.modifierFlags.rawValue), false)
+        }
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses {
+            guard let key = press.key else { continue }
+            onKeyEvent?(Int32(key.keyCode.rawValue), Int32(key.modifierFlags.rawValue), false)
+        }
+    }
+
+    // ── Layout change detection for dynamic resize ──────────────────
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        onLayoutChange?()
     }
 
     // ── Touch handling ──────────────────────────────────────────────
@@ -97,6 +163,10 @@ struct EguiView: UIViewRepresentable {
         private weak var hostView: MetalHostView?
         private var keyboardShown = false
 
+        // Track last known pixel size to detect resize
+        private var lastPixelWidth: UInt32 = 0
+        private var lastPixelHeight: UInt32 = 0
+
         override init() {
             super.init()
             UNUserNotificationCenter.current().delegate = self
@@ -123,6 +193,8 @@ struct EguiView: UIViewRepresentable {
             let layerPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(view.metalLayer).toOpaque())
             renderer = RendererHandle(layerPtr, wPx, hPx, ppp)
             hostView = view
+            lastPixelWidth = wPx
+            lastPixelHeight = hPx
 
             // Tell Rust where to save downloaded / pulled files
             do {
@@ -131,7 +203,6 @@ struct EguiView: UIViewRepresentable {
             } catch {
                 print("[Storage] Failed to set Downloads directory: \(error)")
             }
-
 
             // ── Wire up touch callbacks ──
             view.onTouch = { [weak self] phase, pt in
@@ -146,13 +217,42 @@ struct EguiView: UIViewRepresentable {
                 }
             }
 
-            // ── Wire up keyboard callbacks ──
+            // ── Wire up keyboard callbacks (soft keyboard) ──
             view.onTextInput = { [weak self] text in
                 self?.renderer?.sendTextInput(text)
             }
 
             view.onDeleteBackward = { [weak self] in
                 self?.renderer?.sendDeleteBackward()
+            }
+
+            // ── Wire up hardware keyboard callbacks (iPad external keyboard) ──
+            view.onKeyEvent = { [weak self] keyCode, modifierFlags, pressed in
+                self?.renderer?.sendKeyEvent(keyCode: keyCode, modifierFlags: modifierFlags, pressed: pressed)
+            }
+
+            // ── Wire up trackpad scroll gesture ──
+            let scrollGR = UIPanGestureRecognizer(target: self, action: #selector(handleTrackpadScroll(_:)))
+            scrollGR.allowedScrollTypesMask = [.continuous, .discrete]
+            scrollGR.maximumNumberOfTouches = 0  // Only respond to scroll events, not finger pans
+            view.addGestureRecognizer(scrollGR)
+
+            view.onScroll = { [weak self] dx, dy in
+                self?.renderer?.sendScroll(Float(dx), Float(dy))
+            }
+
+            // ── Wire up trackpad hover gesture ──
+            let hoverGR = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
+            view.addGestureRecognizer(hoverGR)
+
+            view.onHover = { [weak self] x, y in
+                self?.renderer?.sendPointerMoved(Float(x), Float(y))
+            }
+
+            // ── Wire up layout change callback for dynamic resize ──
+            view.onLayoutChange = { [weak self, weak view] in
+                guard let self, let view else { return }
+                self.resizeIfNeeded(view: view)
             }
 
             let dl = CADisplayLink(target: self, selector: #selector(tick))
@@ -168,8 +268,38 @@ struct EguiView: UIViewRepresentable {
             let hPx = UInt32(view.bounds.size.height * scale)
             if wPx == 0 || hPx == 0 { return }
 
-            r.setPixelsPerPoint(Float(scale))
-            r.resize(wPx, hPx)
+            // Only reconfigure if size actually changed
+            if wPx != lastPixelWidth || hPx != lastPixelHeight {
+                lastPixelWidth = wPx
+                lastPixelHeight = hPx
+                view.metalLayer.drawableSize = CGSize(width: Int(wPx), height: Int(hPx))
+                r.setPixelsPerPoint(Float(scale))
+                r.resize(wPx, hPx)
+            }
+        }
+
+        // ── Trackpad scroll gesture handler ─────────────────────────
+
+        @objc private func handleTrackpadScroll(_ gesture: UIPanGestureRecognizer) {
+            guard let view = gesture.view as? MetalHostView else { return }
+            let delta = gesture.translation(in: view)
+            gesture.setTranslation(.zero, in: view)
+            view.onScroll?(delta.x, delta.y)
+        }
+
+        // ── Trackpad hover gesture handler ──────────────────────────
+
+        @objc private func handleHover(_ gesture: UIHoverGestureRecognizer) {
+            guard let view = gesture.view as? MetalHostView else { return }
+            switch gesture.state {
+            case .began, .changed:
+                let pt = gesture.location(in: view)
+                view.onHover?(pt.x, pt.y)
+            case .ended, .cancelled:
+                view.onHoverEnded?()
+            default:
+                break
+            }
         }
 
         @objc private func tick() {
