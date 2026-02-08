@@ -12,7 +12,7 @@ swift-bridge-build = "0.1"
 
 [dependencies]
 swift-bridge = "0.1"
-egui = { version = "0.33", features = ["serde"] }
+egui = { version = "0.33", features = ["serde", "rayon", "accesskit"] }
 wgpu = "28.0.0"
 pollster = "0.4.0"
 egui_wgpu_backend = { git = "https://github.com/shadowbrok3r/egui_wgpu_backend" }
