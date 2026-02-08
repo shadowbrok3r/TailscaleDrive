@@ -8,3 +8,5 @@ TailscaleDrive/.swiftpm/configuration/registries.json
 TailscaleDrive/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 TailscaleDrive/.netrc
 TailscaleDrive/xtool
+TailscaleDrive/rust/target
+TailscaleDrive/RustLibs/**

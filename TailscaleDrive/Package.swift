@@ -1,24 +1,30 @@
 // swift-tools-version: 6.0
 
+// Package.swift
 import PackageDescription
+import Foundation
+
+let root = FileManager.default.currentDirectoryPath
 
 let package = Package(
-    name: "TailscaleDrive",
-    platforms: [
-        .iOS(.v17),
-        .macOS(.v14),
-    ],
-    products: [
-        // An xtool project should contain exactly one library product,
-        // representing the main app.
-        .library(
-            name: "TailscaleDrive",
-            targets: ["TailscaleDrive"]
-        ),
-    ],
-    targets: [
-        .target(
-            name: "TailscaleDrive"
-        ),
-    ]
+  name: "TailscaleDrive",
+  platforms: [.iOS(.v17)],
+  products: [
+    .library(name: "TailscaleDrive", targets: ["TailscaleDrive"]),
+  ],
+  targets: [
+    .target(
+      name: "BridgeFFI",
+      path: "Sources/BridgeFFI",
+      publicHeadersPath: "include"
+    ),
+    .target(
+      name: "TailscaleDrive",
+      dependencies: ["BridgeFFI"],
+      linkerSettings: [
+        .unsafeFlags(["-L", "\(root)/RustLibs"]),
+        .linkedLibrary("tailscale_drive"),
+      ]
+    ),
+  ]
 )

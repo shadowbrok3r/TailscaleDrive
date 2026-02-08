@@ -5,13 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, State},
+    body::{Body, Bytes},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::Response,
-    routing::get,
+    routing::{get, put},
 };
-use serde::Serialize;
+use serde::{Deserialize as SerdeDeserialize, Serialize};
 use tokio_util::io::ReaderStream;
 
 // --- Shared State ---
@@ -62,9 +62,13 @@ pub fn unix_timestamp() -> u64 {
 async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let sent = state.last_sent.lock().unwrap().clone();
     let last_received = state.received.lock().unwrap().last_file.clone();
+    let server_cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
     Json(serde_json::json!({
         "last_sent_file": sent,
         "last_received_file": last_received,
+        "server_cwd": server_cwd,
     }))
 }
 
@@ -159,6 +163,123 @@ async fn download_last_handler(
     download_file_handler(State(state), Path(name)).await
 }
 
+// --- Browse / Upload ---
+
+#[derive(SerdeDeserialize)]
+struct BrowseQuery {
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RemoteFileInfo {
+    name: String,
+    is_dir: bool,
+    size: i64,
+    modified: u64,
+}
+
+/// GET /browse?path=<optional> — list files in a directory (defaults to $HOME).
+async fn browse_handler(
+    Query(params): Query<BrowseQuery>,
+) -> Result<Json<Vec<RemoteFileInfo>>, (StatusCode, String)> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let base = params.path.unwrap_or(home);
+    let base_path = std::path::PathBuf::from(&base);
+
+    if !base_path.exists() || !base_path.is_dir() {
+        return Err((StatusCode::NOT_FOUND, "Directory not found".to_string()));
+    }
+
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&base_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if let Ok(metadata) = entry.metadata() {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                files.push(RemoteFileInfo {
+                    name,
+                    is_dir: metadata.is_dir(),
+                    size: metadata.len() as i64,
+                    modified,
+                });
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(files))
+}
+
+/// GET /pull?path=<filepath> — download an arbitrary file from the server's filesystem
+async fn pull_file_handler(
+    Query(params): Query<BrowseQuery>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let path_str = params
+        .path
+        .ok_or((StatusCode::BAD_REQUEST, "Missing path parameter".to_string()))?;
+    let file_path = std::path::PathBuf::from(&path_str);
+
+    if !file_path.exists() || !file_path.is_file() {
+        return Err((StatusCode::NOT_FOUND, format!("File not found: {}", path_str)));
+    }
+
+    let file = tokio::fs::File::open(&file_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let metadata = file.metadata().await.ok();
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let filename = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        );
+
+    if let Some(meta) = metadata {
+        builder = builder.header(header::CONTENT_LENGTH, meta.len());
+    }
+
+    builder
+        .body(body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// PUT /upload/{*path} — upload a file (raw body bytes) to the given path relative to $HOME.
+async fn upload_handler(
+    Path(file_path): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let dest = std::path::PathBuf::from(&home).join(&file_path);
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    std::fs::write(&dest, &body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    log::info!("Uploaded: {}", file_path);
+    Ok(StatusCode::OK)
+}
+
 // --- Server ---
 
 pub async fn run_status_server(state: AppState) -> anyhow::Result<()> {
@@ -167,6 +288,9 @@ pub async fn run_status_server(state: AppState) -> anyhow::Result<()> {
         .route("/files", get(list_files_handler))
         .route("/download", get(download_last_handler))
         .route("/download/{name}", get(download_file_handler))
+        .route("/browse", get(browse_handler))
+        .route("/pull", get(pull_file_handler))
+        .route("/upload/{*path}", put(upload_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
