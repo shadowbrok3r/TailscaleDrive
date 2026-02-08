@@ -910,12 +910,14 @@ const STYLE: &str = r#"{"override_text_style":null,"override_font_id":null,"over
 
 fn apply_theme(ctx: &egui::Context) {
     match serde_json::from_str::<egui::Style>(STYLE) {
-        Ok(theme) => {
+        Ok(mut theme) => {
+            theme.override_font_id = Some(egui::FontId::new(15., egui::FontFamily::Proportional));
             ctx.set_style(std::sync::Arc::new(theme));
         }
         Err(e) => {
             eprintln!("[theme] serde_json deserialize failed: {e}");
             let mut style = (*ctx.style()).clone();
+            style.override_font_id = Some(egui::FontId::new(15., egui::FontFamily::Proportional));
             style.visuals.dark_mode = true;
             style.visuals.panel_fill = Color32::from_rgb(12, 12, 15);
             style.visuals.window_fill = Color32::from_rgb(11, 11, 15);

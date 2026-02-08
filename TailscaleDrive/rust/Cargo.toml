@@ -1,21 +1,17 @@
 [package]
 name = "tailscale-drive"
 version = "0.1.0"
-edition = "2021"
-publish = []
-
+edition = "2024"
 build = "build.rs"
 
 [lib]
 crate-type = ["staticlib"]
 
-
-
 [build-dependencies]
-swift-bridge-build = { path = "/home/shadowbroker/Desktop/swift-bridge/crates/swift-bridge-build" }
+swift-bridge-build = "0.1"
 
 [dependencies]
-swift-bridge = { path = "/home/shadowbroker/Desktop/swift-bridge/" }
+swift-bridge = "0.1"
 egui = { version = "0.32", features = ["serde"] }
 wgpu = "26.0"
 pollster = "0.4.0"

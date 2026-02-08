@@ -10,7 +10,7 @@ C_DST="$ROOT/Sources/BridgeFFI/include"
 LIB_DST="$ROOT/RustLibs"
 
 # 1) Build Rust for device
-cargo build --manifest-path "$RUST/Cargo.toml" --target aarch64-apple-ios
+cargo build --manifest-path "$RUST/Cargo.toml" --target aarch64-apple-ios --release
 
 # 2) Remove stale generated bindings from the Swift target
 #    Only delete files that are produced by swift-bridge and that you copy in.
@@ -54,9 +54,9 @@ done
 mkdir -p "$LIB_DST"
 
 # Copy whatever staticlib was produced (avoid hardcoded name mismatch)
-LIB="$(find "$RUST/target/aarch64-apple-ios/debug" -maxdepth 1 -type f -name 'lib*.a' | head -n 1)"
+LIB="$(find "$RUST/target/aarch64-apple-ios/release" -maxdepth 1 -type f -name 'lib*.a' | head -n 1)"
 if [[ -z "${LIB:-}" ]]; then
-  echo "ERROR: No .a produced in $RUST/target/aarch64-apple-ios/debug"
+  echo "ERROR: No .a produced in $RUST/target/aarch64-apple-ios/release"
   echo "Ensure Cargo.toml has [lib] crate-type = [\"staticlib\"]"
   exit 1
 fi
