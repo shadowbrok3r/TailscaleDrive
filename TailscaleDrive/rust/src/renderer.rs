@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, pos2, vec2};
 use egui_wgpu_backend::{RenderPass as EguiWgpuRenderer, ScreenDescriptor};
@@ -75,6 +76,16 @@ pub struct Renderer {
     sync_local_file: Option<String>,
     /// Whether we already fetched sync projects from server
     sync_projects_fetched: bool,
+
+    // Long-press tracking (for iOS context menus via simulated right-click)
+    long_press_start: Option<(f32, f32, Instant)>,
+    long_press_fired: bool,
+
+    // File preview state
+    show_preview: bool,
+    preview_filename: String,
+    preview_text: String,
+    preview_texture: Option<egui::TextureHandle>,
 
     // iOS keyboard state
     wants_keyboard: bool,
@@ -171,6 +182,14 @@ impl Renderer {
             sync_local_file: None,
             sync_projects_fetched: false,
 
+            long_press_start: None,
+            long_press_fired: false,
+
+            show_preview: false,
+            preview_filename: String::new(),
+            preview_text: String::new(),
+            preview_texture: None,
+
             wants_keyboard: false,
         }
     }
@@ -224,14 +243,31 @@ impl Renderer {
             pressed: true,
             modifiers: egui::Modifiers::default(),
         });
+        // Start tracking for long-press (context menu on iOS)
+        self.long_press_start = Some((x_pt, y_pt, Instant::now()));
+        self.long_press_fired = false;
     }
 
     pub fn touch_moved(&mut self, x_pt: f32, y_pt: f32) {
         self.pending_events
             .push(egui::Event::PointerMoved(pos2(x_pt, y_pt)));
+        // Cancel long-press if finger moved too far from start
+        if let Some((sx, sy, _)) = self.long_press_start {
+            let dx = x_pt - sx;
+            let dy = y_pt - sy;
+            if (dx * dx + dy * dy).sqrt() > 10.0 {
+                self.long_press_start = None;
+            }
+        }
     }
 
     pub fn touch_ended(&mut self, x_pt: f32, y_pt: f32) {
+        self.long_press_start = None;
+        // If a long-press just fired, suppress the normal touch-end sequence
+        // to avoid PointerGone closing the freshly-opened context menu.
+        if self.long_press_fired {
+            return;
+        }
         let pos = pos2(x_pt, y_pt);
         self.pending_events.push(egui::Event::PointerMoved(pos));
         self.pending_events.push(egui::Event::PointerButton {
@@ -417,6 +453,42 @@ impl Renderer {
             }
         }
 
+        // Take preview content from client if available
+        if let Some((filename, data)) = self.client.preview_content.take() {
+            let ext = file_extension(&filename);
+            self.preview_filename = filename.clone();
+            self.preview_texture = None;
+            self.preview_text.clear();
+
+            if is_image_ext(&ext) {
+                if let Ok(img) = image::load_from_memory(&data) {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    let texture = self.egui_ctx.load_texture(
+                        &filename,
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.preview_texture = Some(texture);
+                } else {
+                    self.preview_text = "(Failed to decode image)".to_string();
+                }
+            } else {
+                let text = String::from_utf8_lossy(&data);
+                if text.len() > 100_000 {
+                    self.preview_text = format!(
+                        "{}…\n\n(truncated at 100 KB)",
+                        &text[..100_000]
+                    );
+                } else {
+                    self.preview_text = text.into_owned();
+                }
+            }
+            self.show_preview = true;
+        }
+
         // ── egui frame ──
         let width_px = self.config.width;
         let height_px = self.config.height;
@@ -428,6 +500,36 @@ impl Renderer {
 
         let mut viewports = egui::ViewportIdMap::default();
         viewports.insert(egui::ViewportId::ROOT, viewport_info);
+
+        // Long-press detection: after 500ms hold without movement, inject a
+        // secondary (right-click) event to trigger egui context menus on iOS.
+        if let Some((x, y, start_time)) = self.long_press_start {
+            if !self.long_press_fired && start_time.elapsed() >= Duration::from_millis(500) {
+                self.long_press_fired = true;
+                self.long_press_start = None;
+                let pos = pos2(x, y);
+                // Release the primary button first
+                self.pending_events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+                // Inject secondary click (press + release = right-click)
+                self.pending_events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                });
+                self.pending_events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+        }
 
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -452,6 +554,7 @@ impl Renderer {
             let mut do_refresh = false;
             let mut do_browse: Option<Option<String>> = None;
             let mut file_to_pull: Option<String> = None;
+            let mut file_to_preview: Option<String> = None;
             let mut do_upload: Option<(String, String)> = None; // (local, remote)
             let mut do_create_sync: Option<(String, String)> = None; // (local, remote)
             let mut do_delete_sync: Option<String> = None;
@@ -558,6 +661,7 @@ impl Renderer {
                                     &mut do_download_last,
                                     &mut do_browse,
                                     &mut file_to_pull,
+                                    &mut file_to_preview,
                                 );
                             }
                             Page::ProjectSync => {
@@ -575,6 +679,54 @@ impl Renderer {
                     });
             });
 
+            // ═══════════════════════════════════════════════════
+            //  PREVIEW WINDOW (floating overlay)
+            // ═══════════════════════════════════════════════════
+            if self.show_preview {
+                let mut open = true;
+                egui::Window::new(format!("Preview: {}", self.preview_filename))
+                    .open(&mut open)
+                    .resizable(true)
+                    .collapsible(false)
+                    .default_size([width_pt - 40.0, height_pt * 0.7])
+                    .show(ctx, |ui| {
+                        if let Some(ref texture) = self.preview_texture {
+                            // Image preview
+                            egui::ScrollArea::both()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let available = ui.available_size();
+                                    let tex_size = texture.size_vec2();
+                                    let scale = (available.x / tex_size.x)
+                                        .min(available.y / tex_size.y)
+                                        .min(1.0);
+                                    let display_size =
+                                        vec2(tex_size.x * scale, tex_size.y * scale);
+                                    ui.image((texture.id(), display_size));
+                                });
+                        } else {
+                            // Text / code preview
+                            egui::ScrollArea::both()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(
+                                            &mut self.preview_text,
+                                        )
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                    );
+                                });
+                        }
+                    });
+                if !open {
+                    self.show_preview = false;
+                    self.preview_text.clear();
+                    self.preview_texture = None;
+                    self.preview_filename.clear();
+                }
+            }
+
             // Apply deferred actions
             if let Some(ref name) = file_to_download {
                 self.client.download_file(name);
@@ -590,6 +742,9 @@ impl Renderer {
             }
             if let Some(ref name) = file_to_pull {
                 self.client.pull_file(name);
+            }
+            if let Some(ref path) = file_to_preview {
+                self.client.preview_file(path);
             }
             if let Some((local, remote)) = do_upload {
                 self.client.upload_file(&local, &remote);
@@ -703,6 +858,7 @@ impl Renderer {
         do_download_last: &mut bool,
         do_browse: &mut Option<Option<String>>,
         file_to_pull: &mut Option<String>,
+        file_to_preview: &mut Option<String>,
     ) {
         // ─── Server Config ───
         ui.group(|ui| {
@@ -931,43 +1087,6 @@ impl Renderer {
 
         ui.add_space(8.0);
 
-        // Action buttons for selected remote file
-        if let Some(sel_idx) = self.selected_remote_idx {
-            if let Some(selected) = self.client.remote_files.get(sel_idx) {
-                if !selected.is_dir {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("📄 {}", selected.name)).strong(),
-                        );
-                        ui.label(
-                            RichText::new(format_size(selected.size as u64))
-                                .weak()
-                                .small(),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "Modified: {}",
-                                format_timestamp(selected.modified)
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                    });
-                    if ui.button("📥 Pull File to iPhone").clicked() {
-                        let full_path = if self.browse_path_input.is_empty()
-                            || self.browse_path_input == "/"
-                        {
-                            format!("/{}", selected.name)
-                        } else {
-                            format!("{}/{}", self.browse_path_input, selected.name)
-                        };
-                        *file_to_pull = Some(full_path);
-                    }
-                }
-            }
-        }
-
         // ─── Remote File Browser ───
         ui.group(|ui| {
             ui.label(
@@ -1036,6 +1155,45 @@ impl Renderer {
             } else if self.client.remote_files.is_empty() {
                 ui.label(RichText::new("Empty directory").weak());
             } else {
+                // Action buttons for selected remote file
+                if let Some(sel_idx) = self.selected_remote_idx {
+                    if let Some(selected) = self.client.remote_files.get(sel_idx) {
+                        if !selected.is_dir {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("📄 {}", selected.name)).strong(),
+                                );
+                                ui.label(
+                                    RichText::new(format_size(selected.size as u64))
+                                        .weak()
+                                        .small(),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Modified: {}",
+                                        format_timestamp(selected.modified)
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            });
+                            if ui.button("📥 Pull File to iPhone").clicked() {
+                                let full_path = if self.browse_path_input.is_empty()
+                                    || self.browse_path_input == "/"
+                                {
+                                    format!("/{}", selected.name)
+                                } else {
+                                    format!("{}/{}", self.browse_path_input, selected.name)
+                                };
+                                *file_to_pull = Some(full_path);
+                            }
+                        }
+                    }
+                } else {
+                    ui.label(RichText::new("No file selected").strong());
+                }
+
                 let mut dir_indices: Vec<usize> = Vec::new();
                 let mut file_indices: Vec<usize> = Vec::new();
                 for (i, f) in self.client.remote_files.iter().enumerate() {
@@ -1071,6 +1229,19 @@ impl Renderer {
                     let is_selected = self.selected_remote_idx == Some(idx);
                     let icon = if entry.is_dir { "📂" } else { "📄" };
 
+                    // Pre-clone data needed by the context_menu closure
+                    let entry_name = entry.name.clone();
+                    let entry_size = entry.size;
+                    let entry_modified = entry.modified;
+                    let entry_is_dir = entry.is_dir;
+                    let full_path = if self.browse_path_input.is_empty()
+                        || self.browse_path_input == "/"
+                    {
+                        format!("/{}", entry.name)
+                    } else {
+                        format!("{}/{}", self.browse_path_input, entry.name)
+                    };
+
                     let label_text = if entry.is_dir {
                         format!("{} {}/", icon, entry.name)
                     } else {
@@ -1084,17 +1255,49 @@ impl Renderer {
 
                     let response =
                         ui.selectable_label(is_selected, RichText::new(&label_text));
-                    
+
+                    // Context menu: uses pre-cloned data so it works
+                    // correctly with long-press (secondary click) even
+                    // before the item is formally selected.
+                    if !entry_is_dir {
+                        response.context_menu(|ui| {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("📄 {}", entry_name)).strong(),
+                                );
+                                ui.label(
+                                    RichText::new(format_size(entry_size as u64))
+                                        .weak()
+                                        .small(),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Modified: {}",
+                                        format_timestamp(entry_modified)
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            });
+                            ui.separator();
+                            if ui.button("📥 Pull File to iPhone").clicked() {
+                                *file_to_pull = Some(full_path.clone());
+                                ui.close();
+                            }
+                            let ext = file_extension(&entry_name);
+                            if is_previewable(&ext) {
+                                if ui.button("👁 Preview").clicked() {
+                                    *file_to_preview = Some(full_path.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+
                     if response.clicked() {
-                        if entry.is_dir {
-                            let new_path = if self.browse_path_input.is_empty()
-                                || self.browse_path_input == "/"
-                            {
-                                format!("/{}", entry.name)
-                            } else {
-                                format!("{}/{}", self.browse_path_input, entry.name)
-                            };
-                            nav_to = Some(new_path);
+                        if entry_is_dir && !self.long_press_fired {
+                            nav_to = Some(full_path);
                         } else {
                             self.selected_remote_idx = Some(idx);
                         }
@@ -1759,4 +1962,45 @@ fn apply_theme(ctx: &egui::Context) {
             ctx.set_style(style);
         }
     }
+}
+
+// ── File type helpers ────────────────────────────────────────────────────
+
+fn file_extension(name: &str) -> String {
+    if let Some(pos) = name.rfind('.') {
+        name[pos + 1..].to_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+fn is_text_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "sh" | "bash" | "zsh" | "fish"
+            | "txt" | "text" | "log"
+            | "yml" | "yaml"
+            | "json" | "jsonc"
+            | "md" | "markdown"
+            | "toml" | "ini" | "cfg" | "conf"
+            | "xml" | "html" | "htm" | "css" | "scss"
+            | "csv" | "tsv"
+            | "rs" | "py" | "js" | "ts" | "tsx" | "jsx"
+            | "c" | "cpp" | "h" | "hpp" | "cc"
+            | "java" | "kt" | "kts"
+            | "swift" | "m" | "mm"
+            | "go" | "rb" | "php" | "pl"
+            | "sql" | "graphql" | "gql"
+            | "env" | "gitignore" | "dockerignore"
+            | "makefile" | "cmake"
+            | "dockerfile"
+    )
+}
+
+fn is_image_ext(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp")
+}
+
+fn is_previewable(ext: &str) -> bool {
+    is_text_ext(ext) || is_image_ext(ext)
 }

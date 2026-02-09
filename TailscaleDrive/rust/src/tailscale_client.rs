@@ -69,6 +69,7 @@ pub enum ClientEvent {
     BrowseUpdate(Vec<RemoteFile>),
     DownloadComplete { filename: String, data: Vec<u8> },
     PullComplete { filename: String, data: Vec<u8> },
+    PreviewComplete { filename: String, data: Vec<u8> },
     PeersUpdate(Vec<PeerInfo>),
     SyncProjectsUpdate(Vec<SyncProject>),
     SyncChangesAvailable(Vec<SyncChange>),
@@ -82,6 +83,7 @@ pub enum ClientCommand {
     DownloadLast,
     Browse(Option<String>),
     PullFile(String),
+    PreviewFile(String),
     Refresh,
     UploadFile { local_path: String, remote_dest_path: String },
     CreateSyncProject { local_path: String, remote_path: String },
@@ -115,6 +117,8 @@ pub struct TailscaleClient {
     pub sync_status: Option<String>,
     /// Pending notifications for sync events: (title, body)
     pub pending_sync_notifications: Vec<(String, String)>,
+    /// Preview content received from server (filename, raw bytes)
+    pub preview_content: Option<(String, Vec<u8>)>,
 
     event_rx: mpsc::Receiver<ClientEvent>,
     command_tx: mpsc::Sender<ClientCommand>,
@@ -147,6 +151,7 @@ impl TailscaleClient {
             sync_projects: Vec::new(),
             sync_status: None,
             pending_sync_notifications: Vec::new(),
+            preview_content: None,
             event_rx,
             command_tx,
         }
@@ -280,6 +285,9 @@ impl TailscaleClient {
                         format!("Updated: {}", filename),
                     ));
                 }
+                ClientEvent::PreviewComplete { filename, data } => {
+                    self.preview_content = Some((filename, data));
+                }
                 ClientEvent::Error(msg) => {
                     self.download_status = Some(format!("✗ {}", msg));
                 }
@@ -301,6 +309,10 @@ impl TailscaleClient {
 
     pub fn pull_file(&self, name: &str) {
         let _ = self.command_tx.send(ClientCommand::PullFile(name.to_string()));
+    }
+
+    pub fn preview_file(&self, path: &str) {
+        let _ = self.command_tx.send(ClientCommand::PreviewFile(path.to_string()));
     }
 
     pub fn refresh(&self) {
@@ -409,6 +421,23 @@ fn poll_loop(
                             Ok((filename, data)) => {
                                 if event_tx
                                     .send(ClientEvent::PullComplete { filename, data })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    ClientCommand::PreviewFile(path) => {
+                        match http_pull_remote_file(&agent, base_url, &path) {
+                            Ok((filename, data)) => {
+                                if event_tx
+                                    .send(ClientEvent::PreviewComplete { filename, data })
                                     .is_err()
                                 {
                                     return;
