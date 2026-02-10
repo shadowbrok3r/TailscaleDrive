@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText, pos2, vec2};
 use egui_wgpu_backend::{RenderPass as EguiWgpuRenderer, ScreenDescriptor};
 
-use crate::tailscale_client::{format_size, format_timestamp, load_cached_peers, TailscaleClient};
+use crate::tailscale_client::{format_size, format_timestamp, format_date_mmddyyyy, load_cached_peers, TailscaleClient};
 
 const DEFAULT_SERVER_URL: &str = "http://manjaro-work.taile483f.ts.net:8080";
 
@@ -87,8 +87,37 @@ pub struct Renderer {
     preview_text: String,
     preview_texture: Option<egui::TextureHandle>,
 
+    // ── Overwrite confirmation modal state ──
+    show_overwrite_modal: bool,
+    /// Pending sync info for overwrite check
+    overwrite_pending: Option<OverwritePending>,
+    /// Whether we're waiting for a file-info response from the server
+    overwrite_checking: bool,
+    /// Deferred: remote file path to initiate "sync to iPhone" from context menu
+    pending_sync_from_remote: Option<String>,
+
     // iOS keyboard state
     wants_keyboard: bool,
+}
+
+/// Data for the overwrite confirmation modal
+#[derive(Clone)]
+struct OverwritePending {
+    /// iOS local file path (source)
+    ios_path: String,
+    /// Desktop destination path
+    desktop_path: String,
+    /// Timestamp of the iOS file
+    ios_modified: u64,
+    /// Timestamp of the existing desktop file (0 if doesn't exist)
+    desktop_modified: u64,
+    /// Size of the existing desktop file
+    desktop_size: u64,
+    /// Whether the desktop file exists
+    desktop_exists: bool,
+    /// Whether this sync was initiated from the remote file browser
+    /// (pulling from desktop to iOS, rather than pushing from iOS to desktop)
+    from_remote: bool,
 }
 
 impl Renderer {
@@ -189,6 +218,11 @@ impl Renderer {
             preview_filename: String::new(),
             preview_text: String::new(),
             preview_texture: None,
+
+            show_overwrite_modal: false,
+            overwrite_pending: None,
+            overwrite_checking: false,
+            pending_sync_from_remote: None,
 
             wants_keyboard: false,
         }
@@ -396,6 +430,29 @@ impl Renderer {
 
         // Process network events from the background thread
         self.client.process_events();
+
+        // ── Handle file-info response for overwrite modal ──
+        if self.overwrite_checking {
+            if let Some((path, info)) = self.client.file_info_result.take() {
+                self.overwrite_checking = false;
+                if let Some(ref mut pending) = self.overwrite_pending {
+                    if pending.desktop_path == path {
+                        pending.desktop_exists = info.exists;
+                        pending.desktop_modified = info.modified;
+                        pending.desktop_size = info.size;
+                        if info.exists {
+                            // File exists — show the overwrite modal
+                            self.show_overwrite_modal = true;
+                        } else {
+                            // File doesn't exist — proceed directly
+                            let p = pending.clone();
+                            self.overwrite_pending = None;
+                            self.execute_sync_creation(p);
+                        }
+                    }
+                }
+            }
+        }
 
         // Auto-browse server CWD once connected
         if self.client.connected && !self.auto_browsed {
@@ -727,6 +784,91 @@ impl Renderer {
                 }
             }
 
+            // ═══════════════════════════════════════════════════
+            //  OVERWRITE CONFIRMATION MODAL
+            // ═══════════════════════════════════════════════════
+            if self.show_overwrite_modal {
+                let modal_response = egui::Modal::new(egui::Id::new("overwrite_modal")).show(ctx, |ui| {
+                    ui.heading("⚠ File Already Exists");
+                    ui.add_space(8.0);
+
+                    if let Some(ref pending) = self.overwrite_pending.clone() {
+                        let device = self.client.connected_device_name.as_deref().unwrap_or("Remote Device");
+
+                        if pending.from_remote {
+                            // Pulling from desktop to iOS — iOS file exists
+                            let filename = pending.ios_path.rsplit('/').next().unwrap_or(&pending.ios_path);
+                            ui.label(
+                                RichText::new(format!("\"{}\" already exists on this iPhone", filename))
+                                    .strong(),
+                            );
+                            ui.add_space(8.0);
+
+                            egui::Grid::new("overwrite_timestamps").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                ui.label(RichText::new(format!("{} (source):", device)).strong());
+                                ui.label("Will pull latest");
+                                ui.end_row();
+
+                                ui.label(RichText::new("iPhone (existing):").strong());
+                                ui.label(format_date_mmddyyyy(pending.ios_modified));
+                                ui.end_row();
+                            });
+
+                            ui.add_space(12.0);
+                            ui.label("Overwrite the local iPhone file and create a sync?");
+                        } else {
+                            // Pushing from iOS to desktop — desktop file exists
+                            let filename = pending.desktop_path.rsplit('/').next().unwrap_or(&pending.desktop_path);
+                            ui.label(
+                                RichText::new(format!("\"{}\" already exists on {}", filename, device))
+                                    .strong(),
+                            );
+                            ui.add_space(8.0);
+
+                            egui::Grid::new("overwrite_timestamps").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                ui.label(RichText::new("iPhone copy:").strong());
+                                ui.label(format_date_mmddyyyy(pending.ios_modified));
+                                ui.end_row();
+
+                                ui.label(RichText::new(format!("{} copy:", device)).strong());
+                                ui.label(format!(
+                                    "{} ({})",
+                                    format_date_mmddyyyy(pending.desktop_modified),
+                                    format_size(pending.desktop_size)
+                                ));
+                                ui.end_row();
+                            });
+
+                            ui.add_space(12.0);
+                            ui.label("Overwrite the remote file and create a sync?");
+                        }
+
+                        ui.add_space(8.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("✓ Overwrite & Sync").strong().color(Color32::from_rgb(46, 204, 113))).clicked() {
+                                let p = pending.clone();
+                                self.show_overwrite_modal = false;
+                                self.overwrite_pending = None;
+                                self.execute_sync_creation(p);
+                            }
+
+                            ui.add_space(8.0);
+
+                            if ui.button(RichText::new("✗ Cancel").color(Color32::from_rgb(231, 76, 60))).clicked() {
+                                self.show_overwrite_modal = false;
+                                self.overwrite_pending = None;
+                            }
+                        });
+                    }
+                });
+
+                if modal_response.should_close() {
+                    self.show_overwrite_modal = false;
+                    self.overwrite_pending = None;
+                }
+            }
+
             // Apply deferred actions
             if let Some(ref name) = file_to_download {
                 self.client.download_file(name);
@@ -749,17 +891,95 @@ impl Renderer {
             if let Some((local, remote)) = do_upload {
                 self.client.upload_file(&local, &remote);
             }
-            if let Some((local, remote)) = do_create_sync {
-                self.client.upload_file(&local, &remote);
-                self.client.create_sync_project(&local, &remote);
-                self.sync_step = SyncStep::BrowseLocal;
-                self.sync_local_file = None;
+            if let Some((ios_path, desktop_path)) = do_create_sync {
+                // ── Check for duplicates locally first ──
+                let already_synced = self.client.sync_projects.iter().any(|p| p.local_path == desktop_path);
+                if already_synced {
+                    self.client.sync_status = Some(format!("⚠ Already synced: {}", desktop_path.rsplit('/').next().unwrap_or(&desktop_path)));
+                } else {
+                    // Get iOS file modified timestamp
+                    let ios_modified = std::fs::metadata(&ios_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    // Set up overwrite check
+                    self.overwrite_pending = Some(OverwritePending {
+                        ios_path,
+                        desktop_path: desktop_path.clone(),
+                        ios_modified,
+                        desktop_modified: 0,
+                        desktop_size: 0,
+                        desktop_exists: false,
+                        from_remote: false,
+                    });
+                    self.overwrite_checking = true;
+                    self.client.check_file_info(&desktop_path);
+                }
             }
             if let Some(id) = do_delete_sync {
                 self.client.delete_sync_project(&id);
             }
             if do_fetch_sync_projects {
                 self.client.fetch_sync_projects();
+            }
+
+            // ── Handle "Sync to iPhone" from remote context menu ──
+            if let Some(remote_path) = self.pending_sync_from_remote.take() {
+                // Check for duplicate: does a sync for this desktop path already exist?
+                let already_synced = self.client.sync_projects.iter().any(|p| p.local_path == remote_path);
+                if already_synced {
+                    self.client.sync_status = Some(format!(
+                        "⚠ Already synced: {}",
+                        remote_path.rsplit('/').next().unwrap_or(&remote_path)
+                    ));
+                } else {
+                    // Compute the iOS destination path
+                    let filename = remote_path.rsplit('/').next().unwrap_or("file");
+                    let ios_dest = format!(
+                        "{}/{}",
+                        self.client.save_directory.as_deref().unwrap_or("/tmp"),
+                        filename
+                    );
+
+                    // Check if it already exists on iOS
+                    let ios_modified = std::fs::metadata(&ios_dest)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let ios_exists = std::path::Path::new(&ios_dest).exists();
+
+                    if ios_exists {
+                        // File exists on iOS — show overwrite modal with iOS as destination
+                        // (swapped perspective: source is desktop, dest is iOS)
+                        self.overwrite_pending = Some(OverwritePending {
+                            ios_path: ios_dest,
+                            desktop_path: remote_path,
+                            ios_modified,
+                            desktop_modified: 0, // not relevant for from_remote
+                            desktop_size: 0,
+                            desktop_exists: false,
+                            from_remote: true,
+                        });
+                        self.show_overwrite_modal = true;
+                    } else {
+                        // File doesn't exist on iOS — proceed directly
+                        let pending = OverwritePending {
+                            ios_path: ios_dest,
+                            desktop_path: remote_path,
+                            ios_modified: 0,
+                            desktop_modified: 0,
+                            desktop_size: 0,
+                            desktop_exists: false,
+                            from_remote: true,
+                        };
+                        self.execute_sync_creation(pending);
+                    }
+                }
             }
         });
 
@@ -913,10 +1133,10 @@ impl Renderer {
                         let os_icon = match p.os.to_lowercase().as_str() {
                             "linux" => "🐧",
                             "macos" => "🍎",
-                            "windows" => "🪟",
+                            "windows" => "🖳",
                             "android" => "📱",
                             "ios" => "🍎",
-                            _ => "🖥",
+                            _ => "🖳",
                         };
                         format!("{} {} ({})", os_icon, p.hostname, if p.online { "online" } else { "offline" })
                     })
@@ -935,10 +1155,10 @@ impl Renderer {
                                 let os_icon = match peer.os.to_lowercase().as_str() {
                                     "linux" => "🐧",
                                     "macos" => "🍎",
-                                    "windows" => "🪟",
+                                    "windows" => "🖳",
                                     "android" => "📱",
                                     "ios" => "🍎",
-                                    _ => "🖥",
+                                    _ => "🖳",
                                 };
                                 let status_color = if peer.online {
                                     Color32::from_rgb(46, 204, 113)
@@ -1025,7 +1245,7 @@ impl Renderer {
             // Download status toast
             if let Some(ref status) = self.client.download_status {
                 ui.add_space(4.0);
-                let color = if status.starts_with('✓') {
+                let color = if status.starts_with('✔') {
                     Color32::from_rgb(46, 204, 113)
                 } else {
                     Color32::from_rgb(231, 76, 60)
@@ -1139,7 +1359,7 @@ impl Renderer {
 
             // Status toast
             if let Some(ref status) = self.client.browse_status {
-                let color = if status.starts_with('✓') {
+                let color = if status.starts_with('✔') {
                     Color32::from_rgb(46, 204, 113)
                 } else {
                     Color32::GRAY
@@ -1285,6 +1505,10 @@ impl Renderer {
                                 *file_to_pull = Some(full_path.clone());
                                 ui.close();
                             }
+                            if ui.button("🔄 Sync to iPhone").clicked() {
+                                self.pending_sync_from_remote = Some(full_path.clone());
+                                ui.close();
+                            }
                             let ext = file_extension(&entry_name);
                             if is_previewable(&ext) {
                                 if ui.button("👁 Preview").clicked() {
@@ -1362,6 +1586,28 @@ impl Renderer {
         }
     }
 
+    /// Execute the sync creation (upload file + create sync project)
+    fn execute_sync_creation(&mut self, pending: OverwritePending) {
+        if pending.from_remote {
+            // Sync from remote: pull the file to iOS, then create sync project
+            self.client.pull_file(&pending.desktop_path);
+            self.client.create_sync_project(
+                &format!(
+                    "{}/{}",
+                    self.client.save_directory.as_deref().unwrap_or("/tmp"),
+                    pending.desktop_path.rsplit('/').next().unwrap_or("file")
+                ),
+                &pending.desktop_path,
+            );
+        } else {
+            // Sync from iOS to desktop: upload file, then create sync project
+            self.client.upload_file(&pending.ios_path, &pending.desktop_path);
+            self.client.create_sync_project(&pending.ios_path, &pending.desktop_path);
+        }
+        self.sync_step = SyncStep::BrowseLocal;
+        self.sync_local_file = None;
+    }
+
     fn draw_project_sync_page(
         &mut self,
         ui: &mut egui::Ui,
@@ -1385,7 +1631,7 @@ impl Renderer {
     fn draw_sync_browse_local(
         &mut self,
         ui: &mut egui::Ui,
-        _do_browse: &mut Option<Option<String>>,
+        do_browse: &mut Option<Option<String>>,
         _file_to_pull: &mut Option<String>,
         do_upload: &mut Option<(String, String)>,
         do_delete_sync: &mut Option<String>,
@@ -1417,32 +1663,80 @@ impl Renderer {
                 ui.label(RichText::new("No active syncs — select a file below to start").weak());
             } else {
                 let mut delete_id: Option<String> = None;
+                let mut add_to_current_file: Option<String> = None;
+                let connected_device = self.client.connected_device_name.clone().unwrap_or_else(|| "Desktop".to_string());
+
                 for project in &self.client.sync_projects {
                     ui.group(|ui| {
+                        let status_icon = if project.paused { "⏸" } else { "🔄" };
+
+                        // ── File name + sync icon ──
+                        let local_name = project.local_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&project.local_path);
+                        let remote_name = project.remote_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&project.remote_path);
+                        let device_label = if project.device_name.is_empty() {
+                            connected_device.clone()
+                        } else {
+                            project.device_name.clone()
+                        };
+
                         ui.horizontal(|ui| {
-                            let status_icon = if project.paused { "⏸" } else { "🔄" };
                             ui.label(RichText::new(status_icon));
-                            ui.vertical(|ui| {
-                                // Show just filenames
-                                let local_name = project.local_path
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or(&project.local_path);
-                                ui.label(RichText::new(local_name).strong());
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Last synced: {}",
-                                        format_timestamp(project.last_synced)
-                                    ))
-                                    .weak()
-                                    .small(),
-                                );
-                            });
+                            ui.label(RichText::new(local_name).strong());
+                        });
+
+                        // ── Device + path info ──
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("  🖥 {}", device_label)).small().color(Color32::from_rgb(100, 149, 237)));
+                            ui.label(RichText::new("↔").small().weak());
+                            ui.label(RichText::new(format!("📱 {}", remote_name)).small().color(Color32::from_rgb(46, 204, 113)));
+                        });
+
+                        // ── Paths (collapsed) ──
+                        ui.label(
+                            RichText::new(format!("  Desktop: {}", project.local_path))
+                                .weak()
+                                .small(),
+                        );
+                        ui.label(
+                            RichText::new(format!("  iPhone: {}", project.remote_path))
+                                .weak()
+                                .small(),
+                        );
+
+                        // ── Last synced + actions ──
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  Last synced: {}",
+                                    format_date_mmddyyyy(project.last_synced)
+                                ))
+                                .weak()
+                                .small(),
+                            );
+
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui.small_button("🗑").clicked() {
                                         delete_id = Some(project.id.clone());
+                                    }
+
+                                    // "Add to current device" — if connected to a different
+                                    // device than the one the sync is on
+                                    if !project.device_name.is_empty()
+                                        && project.device_name != connected_device
+                                        && self.client.connected
+                                    {
+                                        if ui.small_button(format!("➕ {}", connected_device)).clicked() {
+                                            // Re-use this iOS file for a new sync on the connected device
+                                            add_to_current_file = Some(project.remote_path.clone());
+                                        }
                                     }
                                 },
                             );
@@ -1452,12 +1746,18 @@ impl Renderer {
                 if let Some(id) = delete_id {
                     *do_delete_sync = Some(id);
                 }
+                // Trigger "add to current device" flow
+                if let Some(ios_file) = add_to_current_file {
+                    self.sync_local_file = Some(ios_file);
+                    self.sync_step = SyncStep::PickRemoteDest;
+                    *do_browse = Some(None);
+                }
             }
 
             // Sync status toast
             if let Some(ref status) = self.client.sync_status {
                 ui.add_space(4.0);
-                let color = if status.starts_with('✓') {
+                let color = if status.starts_with('✔') {
                     Color32::from_rgb(46, 204, 113)
                 } else {
                     Color32::GRAY
@@ -1613,7 +1913,7 @@ impl Renderer {
     ) {
         // Header with back button
         ui.horizontal(|ui| {
-            if ui.button("← Back").clicked() {
+            if ui.button("⬅ Back").clicked() {
                 self.sync_step = SyncStep::BrowseLocal;
                 self.sync_local_file = None;
             }
@@ -1683,7 +1983,7 @@ impl Renderer {
         });
 
         if let Some(ref status) = self.client.browse_status {
-            let color = if status.starts_with('✓') {
+            let color = if status.starts_with('✔') {
                 Color32::from_rgb(46, 204, 113)
             } else {
                 Color32::GRAY

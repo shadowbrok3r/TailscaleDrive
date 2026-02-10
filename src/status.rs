@@ -94,18 +94,39 @@ pub fn unix_timestamp() -> u64 {
 
 // --- Handlers ---
 
-/// GET /status — JSON status with last sent/received file info
+/// GET /status — JSON status with last sent/received file info + device identity
 async fn status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let sent = state.last_sent.lock().unwrap().clone();
     let last_received = state.received.lock().unwrap().last_file.clone();
     let server_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
+
+    // Find self peer to report device identity
+    let (device_hostname, device_dns) = {
+        let peers = state.peers.lock().unwrap();
+        peers
+            .iter()
+            .find(|p| p.is_self)
+            .map(|p| (p.hostname.clone(), p.dns_name.clone()))
+            .unwrap_or_else(|| (get_system_hostname(), String::new()))
+    };
+
     Json(serde_json::json!({
         "last_sent_file": sent,
         "last_received_file": last_received,
         "server_cwd": server_cwd,
+        "device_hostname": device_hostname,
+        "device_dns": device_dns,
     }))
+}
+
+/// Get the system hostname as a fallback when Tailscale self-peer isn't available yet.
+fn get_system_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// GET /files — list all files waiting in the Taildrop inbox
@@ -351,20 +372,41 @@ struct CreateSyncProjectRequest {
     remote_path: String,
 }
 
-/// POST /sync/projects — create a new sync project
+/// POST /sync/projects — create a new sync project (rejects duplicates)
 async fn sync_create_project(
     State(state): State<AppState>,
     Json(body): Json<CreateSyncProjectRequest>,
 ) -> Result<Json<crate::app_state::SyncProject>, (StatusCode, String)> {
+    let mut projects = state.sync_projects.lock().unwrap();
+
+    // ── Duplicate check: reject if the same desktop file is already synced ──
+    if projects.iter().any(|p| p.local_path == body.local_path) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("A sync already exists for '{}'", body.local_path),
+        ));
+    }
+
+    // ── Populate device identity from Tailscale self-peer ──
+    let (device_name, device_dns) = {
+        let peers = state.peers.lock().unwrap();
+        peers
+            .iter()
+            .find(|p| p.is_self)
+            .map(|p| (p.hostname.clone(), p.dns_name.clone()))
+            .unwrap_or_else(|| (get_system_hostname(), String::new()))
+    };
+
     let project = crate::app_state::SyncProject {
         id: format!("{:x}", rand_id()),
         local_path: body.local_path,
         remote_path: body.remote_path,
         last_synced: unix_timestamp(),
         paused: false,
+        device_name,
+        device_dns,
     };
 
-    let mut projects = state.sync_projects.lock().unwrap();
     projects.push(project.clone());
     save_sync_projects(&projects);
     log::info!("Created sync project: {} -> {}", project.local_path, project.remote_path);
@@ -467,8 +509,56 @@ async fn sync_upload_handler(
     std::fs::write(&dest, &body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // ── Fix permissions so non-root users can read/write the file ──
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o644);
+        let _ = std::fs::set_permissions(&dest, perms);
+    }
+
     log::info!("Sync upload: {}", params.path);
     Ok(StatusCode::OK)
+}
+
+// --- File info endpoint (for overwrite confirmation) ---
+
+#[derive(SerdeDeserialize)]
+struct FileInfoQuery {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct FileInfoResponse {
+    exists: bool,
+    modified: u64,
+    size: u64,
+}
+
+/// GET /sync/file-info?path=<path> — check if a file exists and return its metadata
+async fn sync_file_info(
+    Query(params): Query<FileInfoQuery>,
+) -> Json<FileInfoResponse> {
+    let path = std::path::Path::new(&params.path);
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Json(FileInfoResponse {
+            exists: true,
+            modified,
+            size: metadata.len(),
+        })
+    } else {
+        Json(FileInfoResponse {
+            exists: false,
+            modified: 0,
+            size: 0,
+        })
+    }
 }
 
 /// Simple random ID generator (no external crate needed)
@@ -498,6 +588,7 @@ pub async fn run_status_server(state: AppState) -> anyhow::Result<()> {
         .route("/sync/check", get(sync_check))
         .route("/sync/ack", post(sync_ack))
         .route("/sync/upload", put(sync_upload_handler))
+        .route("/sync/file-info", get(sync_file_info))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB limit for file uploads
         .with_state(state);
 

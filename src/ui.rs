@@ -131,10 +131,10 @@ impl eframe::App for super::app_state::TailscaleDriveApp {
                             let logo = match os.to_lowercase().as_str() {
                                 "linux" => "🐧",
                                 "macos" => "🍎",
-                                "windows" => "🪟",
+                                "windows" => "🖳",
                                 "android" => "📱",
                                 "ios" => "🍎",
-                                _ => "🖥",
+                                _ => "🖳",
                             };
                             let response = ui.selectable_label(
                                 is_selected,

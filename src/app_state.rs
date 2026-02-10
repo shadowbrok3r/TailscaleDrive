@@ -110,6 +110,12 @@ pub struct SyncProject {
     pub remote_path: String,
     pub last_synced: u64,
     pub paused: bool,
+    /// Hostname of the device that owns this sync project
+    #[serde(default)]
+    pub device_name: String,
+    /// DNS name of the device (e.g. "manjaro-work.taile483f.ts.net")
+    #[serde(default)]
+    pub device_dns: String,
 }
 
 #[derive(Debug, Clone)]

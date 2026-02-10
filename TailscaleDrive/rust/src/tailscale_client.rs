@@ -46,6 +46,17 @@ pub struct SyncProject {
     pub remote_path: String,
     pub last_synced: u64,
     pub paused: bool,
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub device_dns: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileInfoResponse {
+    pub exists: bool,
+    pub modified: u64,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +86,8 @@ pub enum ClientEvent {
     SyncChangesAvailable(Vec<SyncChange>),
     UploadComplete { remote_path: String },
     SyncPullComplete { project_id: String, filename: String },
+    FileInfoResult { path: String, info: FileInfoResponse },
+    DeviceInfo { hostname: String, dns: String },
     Error(String),
 }
 
@@ -91,6 +104,7 @@ pub enum ClientCommand {
     DeleteSyncProject(String),
     AckSync { id: String, timestamp: u64 },
     CheckSyncChanges,
+    CheckFileInfo { path: String },
 }
 
 // ── Public client used by the Renderer ──────────────────────────────────
@@ -119,6 +133,12 @@ pub struct TailscaleClient {
     pub pending_sync_notifications: Vec<(String, String)>,
     /// Preview content received from server (filename, raw bytes)
     pub preview_content: Option<(String, Vec<u8>)>,
+    /// Hostname of the connected desktop device
+    pub connected_device_name: Option<String>,
+    /// DNS name of the connected desktop device
+    pub connected_device_dns: Option<String>,
+    /// Latest file info result from server (for overwrite modal)
+    pub file_info_result: Option<(String, FileInfoResponse)>,
 
     event_rx: mpsc::Receiver<ClientEvent>,
     command_tx: mpsc::Sender<ClientCommand>,
@@ -152,6 +172,9 @@ impl TailscaleClient {
             sync_status: None,
             pending_sync_notifications: Vec::new(),
             preview_content: None,
+            connected_device_name: None,
+            connected_device_dns: None,
+            file_info_result: None,
             event_rx,
             command_tx,
         }
@@ -202,7 +225,7 @@ impl TailscaleClient {
                         match std::fs::write(&path, &data) {
                             Ok(_) => {
                                 self.download_status = Some(format!(
-                                    "✓ Saved '{}' ({})",
+                                    "✔ Saved '{}' ({})",
                                     filename,
                                     format_size(size as u64)
                                 ));
@@ -210,14 +233,14 @@ impl TailscaleClient {
                             }
                             Err(e) => {
                                 self.download_status = Some(format!(
-                                    "✗ Failed to save '{}': {}",
+                                    "🗙 Failed to save '{}': {}",
                                     filename, e
                                 ));
                             }
                         }
                     } else {
                         self.download_status = Some(format!(
-                            "✓ Downloaded '{}' ({}) — no save directory set",
+                            "✔ Downloaded '{}' ({}) — no save directory set",
                             filename,
                             format_size(size as u64)
                         ));
@@ -237,7 +260,7 @@ impl TailscaleClient {
                         match std::fs::write(&path, &data) {
                             Ok(_) => {
                                 self.browse_status = Some(format!(
-                                    "✓ Saved '{}' ({})",
+                                    "✔ Saved '{}' ({})",
                                     filename,
                                     format_size(size as u64)
                                 ));
@@ -245,14 +268,14 @@ impl TailscaleClient {
                             }
                             Err(e) => {
                                 self.browse_status = Some(format!(
-                                    "✗ Failed to save '{}': {}",
+                                    "🗙 Failed to save '{}': {}",
                                     filename, e
                                 ));
                             }
                         }
                     } else {
                         self.browse_status = Some(format!(
-                            "✓ Pulled '{}' ({}) — no save directory set",
+                            "✔ Pulled '{}' ({}) — no save directory set",
                             filename,
                             format_size(size as u64)
                         ));
@@ -276,10 +299,10 @@ impl TailscaleClient {
                         .next()
                         .unwrap_or(&remote_path)
                         .to_string();
-                    self.sync_status = Some(format!("✓ Uploaded '{}'", filename));
+                    self.sync_status = Some(format!("✔ Uploaded '{}'", filename));
                 }
                 ClientEvent::SyncPullComplete { project_id: _, filename } => {
-                    self.sync_status = Some(format!("✓ Synced '{}'", filename));
+                    self.sync_status = Some(format!("✔ Synced '{}'", filename));
                     self.pending_sync_notifications.push((
                         "File Synced".to_string(),
                         format!("Updated: {}", filename),
@@ -288,8 +311,15 @@ impl TailscaleClient {
                 ClientEvent::PreviewComplete { filename, data } => {
                     self.preview_content = Some((filename, data));
                 }
+                ClientEvent::FileInfoResult { path, info } => {
+                    self.file_info_result = Some((path, info));
+                }
+                ClientEvent::DeviceInfo { hostname, dns } => {
+                    self.connected_device_name = Some(hostname);
+                    self.connected_device_dns = Some(dns);
+                }
                 ClientEvent::Error(msg) => {
-                    self.download_status = Some(format!("✗ {}", msg));
+                    self.download_status = Some(format!("🗙 {}", msg));
                 }
             }
         }
@@ -343,6 +373,10 @@ impl TailscaleClient {
 
     pub fn check_sync_changes(&self) {
         let _ = self.command_tx.send(ClientCommand::CheckSyncChanges);
+    }
+
+    pub fn check_file_info(&self, path: &str) {
+        let _ = self.command_tx.send(ClientCommand::CheckFileInfo { path: path.to_string() });
     }
 }
 
@@ -539,6 +573,20 @@ fn poll_loop(
                             }
                         }
                     }
+                    ClientCommand::CheckFileInfo { path } => {
+                        match http_check_file_info(&agent, base_url, &path) {
+                            Ok(info) => {
+                                if event_tx.send(ClientEvent::FileInfoResult { path, info }).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                if event_tx.send(ClientEvent::Error(e)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 },
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return, // client dropped
@@ -550,17 +598,21 @@ fn poll_loop(
             last_poll = Instant::now();
 
             match http_fetch_status(&agent, base_url) {
-                Ok((last_sent, last_received, server_cwd)) => {
+                Ok(status) => {
                     if event_tx
                         .send(ClientEvent::StatusUpdate {
                             connected: true,
-                            last_sent,
-                            last_received_file: last_received,
-                            server_cwd,
+                            last_sent: status.last_sent,
+                            last_received_file: status.last_received,
+                            server_cwd: status.server_cwd,
                         })
                         .is_err()
                     {
                         return;
+                    }
+                    // Send device info if available
+                    if let (Some(hostname), Some(dns)) = (status.device_hostname, status.device_dns) {
+                        let _ = event_tx.send(ClientEvent::DeviceInfo { hostname, dns });
                     }
                 }
                 Err(_) => {
@@ -661,10 +713,19 @@ fn poll_loop(
 
 // ── HTTP helpers ────────────────────────────────────────────────────────
 
+/// Status response including device identity
+struct StatusResponse {
+    last_sent: Option<SentFileInfo>,
+    last_received: Option<String>,
+    server_cwd: Option<String>,
+    device_hostname: Option<String>,
+    device_dns: Option<String>,
+}
+
 fn http_fetch_status(
     agent: &ureq::Agent,
     base_url: &str,
-) -> Result<(Option<SentFileInfo>, Option<String>, Option<String>), String> {
+) -> Result<StatusResponse, String> {
     let url = format!("{}/status", base_url);
     let body = agent
         .get(&url)
@@ -700,7 +761,42 @@ fn http_fetch_status(
         .get("server_cwd")
         .and_then(|v| v.as_str().map(String::from));
 
-    Ok((last_sent, last_received, server_cwd))
+    let device_hostname: Option<String> = json
+        .get("device_hostname")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let device_dns: Option<String> = json
+        .get("device_dns")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    Ok(StatusResponse {
+        last_sent,
+        last_received,
+        server_cwd,
+        device_hostname,
+        device_dns,
+    })
+}
+
+fn http_check_file_info(
+    agent: &ureq::Agent,
+    base_url: &str,
+    path: &str,
+) -> Result<FileInfoResponse, String> {
+    let url = format!("{}/sync/file-info", base_url);
+    let body = agent
+        .get(&url)
+        .query("path", path)
+        .call()
+        .map_err(|e| e.to_string())?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    serde_json::from_str(&body).map_err(|e| e.to_string())
 }
 
 fn http_fetch_files(agent: &ureq::Agent, base_url: &str) -> Result<Vec<WaitingFile>, String> {
@@ -1022,6 +1118,31 @@ pub fn format_size(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+/// Format a Unix timestamp as MM/DD/YYYY HH:MM
+pub fn format_date_mmddyyyy(ts: u64) -> String {
+    if ts == 0 {
+        return "Unknown".to_string();
+    }
+    // Howard Hinnant's algorithm for civil date from days since epoch
+    let total_days = (ts / 86400) as i64;
+    let z = total_days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    let secs_in_day = ts % 86400;
+    let hours = secs_in_day / 3600;
+    let minutes = (secs_in_day % 3600) / 60;
+
+    format!("{:02}/{:02}/{:04} {:02}:{:02}", m, d, y, hours, minutes)
 }
 
 pub fn format_timestamp(ts: u64) -> String {
